@@ -31,6 +31,7 @@ class ScraperManager:
         git_config = sources_config.get("git", {}) if isinstance(sources_config, dict) else {}
         sso_config = sources_config.get("sso", {}) if isinstance(sources_config, dict) else {}
         self.base_depth = links_config.get('base_source_depth', 5)
+        self.allowed_path_regexes = links_config.get('allowed_path_regexes', [])
         logger.debug(f"Using base depth of {self.base_depth} for weblist URLs")
 
         scraper_config = {}
@@ -62,6 +63,7 @@ class ScraperManager:
 
         self.web_scraper = LinkScraper(
             verify_urls=self.config.get("verify_urls", True),
+            allowed_path_regexes=self.allowed_path_regexes,
             enable_warnings=self.config.get("enable_warnings", True),
         )
         self._git_scraper: Optional["GitScraper"] = None
