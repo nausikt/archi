@@ -3,7 +3,7 @@ import re
 
 from typing import Dict, Iterator, List, Optional
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, urljoin, urldefrag
+from urllib.parse import urlparse, urljoin, urldefrag, urlunparse
 
 from src.data_manager.collectors.scrapers.scraped_resource import \
     ScrapedResource
@@ -20,8 +20,9 @@ class LinkScraper:
     owned by the scraper manager class. 
     """
 
-    def __init__(self, verify_urls: bool = True, enable_warnings: bool = True) -> None:
+    def __init__(self, verify_urls: bool = True, allowed_path_regexes: List[str] = [], enable_warnings: bool = True) -> None:
         self.verify_urls = verify_urls
+        self.allowed_path_regexes = allowed_path_regexes
         self.enable_warnings = enable_warnings
         # seen_urls tracks anything queued/visited; visited_urls tracks pages actually crawled.
         self.visited_urls = set()
@@ -290,6 +291,24 @@ class LinkScraper:
             return
         self.visited_urls.add(normalized)
         self.seen_urls.add(normalized)
+    
+    def _is_allowed_path(self, path: str) -> bool:
+        return any(re.compile(rx).search(path) for rx in self.allowed_path_regexes)
+
+    def _distinct(self, xs: List[str]) -> List[str]: 
+        """Unique items while preserving order."""
+        seen = set()
+        for x in xs: 
+            if x not in seen:
+                seen.add(x)
+                yield x
+
+    def _twiki_canonical_url(self, url: str) -> str:
+        """
+        Return a canonical Twiki URL by removing query strings and fragments. Drops Twiki-specific parameters (e.g. ?rev=, ?version=, ?skin=) and reconstructs the URL using only scheme, host, and path.
+        """
+        p = urlparse(url)
+        return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
 
     def get_links_with_same_hostname(self, url: str, page_data: ScrapedResource):
         """Return all links on the page that share the same hostname as `url`. For now does not support PDFs"""
@@ -307,8 +326,13 @@ class LinkScraper:
         for tag in a_tags:
             full = urljoin(base_url, tag["href"])
             normalized = self._normalize_url(full)
+            _, link_netloc, link_path, *_ = urlparse(normalized)
             if not normalized:
                 continue
-            if urlparse(normalized).netloc == base_hostname:
-                links.add(normalized)
-        return list(links)
+            if link_netloc == base_hostname:
+                if "twiki" in base_hostname and self._is_allowed_path(link_path):
+                    canonicalized_url = self._twiki_canonical_url(normalized)
+                    links.add(canonicalized_url)
+                else:
+                    links.add(normalized)
+        return list(self._distinct(links))
