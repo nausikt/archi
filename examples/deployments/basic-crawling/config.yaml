@@ -4,7 +4,7 @@
 # The LLM is used through an existing Ollama server.
 #
 # run with:
-# archi create --name my-archi-agent --config examples/deployments/basic-agent/config.yaml --services chatbot --hostmode 
+# archi create --name my-archi-agent --config examples/deployments/basic-crawling/config.yaml --services chatbot --hostmode 
 
 name: my_archi
 
@@ -42,8 +42,8 @@ data_manager:
       denied_path_regexes:
         - "LeftBarLeftBar"
         - "diff"
-      base_source_depth: 2
-      max_pages: 1000
+      base_source_depth: 2      # 2-level crawl in this case gave us 251 docs with-in minutes.
+      max_pages: 1000           # normally we might need depth=3 with more specific allowed patterns.
       input_lists:
         - examples/deployments/basic-crawling/twiki.seeds.list
   embedding_name: HuggingFaceEmbeddings
