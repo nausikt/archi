@@ -38,7 +38,7 @@ class LinkScraper:
         enable_warnings: bool = True,
         allowed_path_regexes: List[str] = [],
         denied_path_regexes: List[str] = [],
-        delay: float = 0.5,
+        delay: float = 60.0,
         delay_jitter: float = 0.3,
     ) -> None:
         self.verify_urls = verify_urls

@@ -44,6 +44,7 @@ data_manager:
         - "diff"
       base_source_depth: 2      # 2-level crawl in this case gave us 251 docs with-in minutes.
       max_pages: 1000           # normally we might need depth=3 with more specific allowed/denied patterns.
+      delay: 60                 # set to the bare minimum tolerated delay for twiki.cern.ch to avoid being blacklisted.
       input_lists:
         - examples/deployments/basic-crawling/twiki.seeds.list
   embedding_name: HuggingFaceEmbeddings
