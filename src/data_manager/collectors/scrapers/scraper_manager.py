@@ -46,6 +46,12 @@ class ScraperManager:
                 self.max_pages = int(raw_max_pages)
             except (TypeError, ValueError):
                 logger.warning(f"Invalid max_pages value {raw_max_pages}; ignoring.")
+        raw_delay = links_config.get("delay", self.config.get("delay", 60.0))
+        try:
+            self.delay = float(raw_delay)
+        except (TypeError, ValueError):
+            logger.warning(f"Invalid links.delay value {raw_delay}; using default 60.0 seconds.")
+            self.delay = 60.0
 
         self.links_enabled = True
         self.git_enabled = git_config.get("enabled", False) if isinstance(git_config, dict) else True
@@ -67,6 +73,7 @@ class ScraperManager:
             enable_warnings=self.config.get("enable_warnings", False),
             allowed_path_regexes=self.allowed_path_regexes,
             denied_path_regexes=self.denied_path_regexes,
+            delay=self.delay,
         )
         self._git_scraper: Optional["GitScraper"] = None
           

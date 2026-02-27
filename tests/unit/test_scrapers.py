@@ -30,7 +30,7 @@ def test_link_scraper_deep_crawl(http_router: OfflineRouter):
 @pytest.mark.slow
 @pytest.mark.routesets("twiki")
 def test_link_scraper_delay(http_router: OfflineRouter):
-    scraper = LinkScraper()
+    scraper = LinkScraper(delay=1.0)
 
     start = time.perf_counter()
     scraped = list(scraper.crawl_iter(
