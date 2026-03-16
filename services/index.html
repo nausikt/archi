@@ -72,13 +72,27 @@
     </li>
         </ul>
     </li>
+    <li class="toctree-l2"><a class="reference internal" href="#service-status-board-alert-banners">Service Status Board &amp; Alert Banners</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#how-it-works">How It Works</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#severity-levels">Severity Levels</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#creating-and-deleting-alerts">Creating and Deleting Alerts</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#api-endpoints">API Endpoints</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#access-control">Access Control</a>
+    </li>
+        </ul>
+    </li>
     <li class="toctree-l2"><a class="reference internal" href="#document-upload">Document Upload</a>
     </li>
     <li class="toctree-l2"><a class="reference internal" href="#data-manager">Data Manager</a>
         <ul>
     <li class="toctree-l3"><a class="reference internal" href="#features">Features</a>
     </li>
-    <li class="toctree-l3"><a class="reference internal" href="#api-endpoints">API Endpoints</a>
+    <li class="toctree-l3"><a class="reference internal" href="#api-endpoints_1">API Endpoints</a>
     </li>
     <li class="toctree-l3"><a class="reference internal" href="#configuration_1">Configuration</a>
     </li>
@@ -220,6 +234,7 @@
 <li>Settings panel for model/provider selection</li>
 <li><a href="../models_providers/#bring-your-own-key-byok">BYOK</a> support</li>
 <li>Conversation history</li>
+<li><a href="#service-status-board--alert-banners">Service Status Board &amp; Alert Banners</a></li>
 </ul>
 <h3 id="configuration">Configuration</h3>
 <pre><code class="language-yaml">services:
@@ -237,6 +252,139 @@
 <pre><code class="language-bash">archi create [...] --services chatbot
 </code></pre>
 <hr />
+<h2 id="service-status-board-alert-banners">Service Status Board &amp; Alert Banners</h2>
+<p>The Service Status Board (SSB) is a built-in feature of the Chat Interface that lets designated operators communicate service health, planned downtime, known issues, and general announcements directly to all users — without external tooling.</p>
+<h3 id="how-it-works">How It Works</h3>
+<p><strong>Alert banners</strong> appear as colour-coded strips at the top of every page in the chat app. Up to 5 active alerts are displayed at once. Each banner can be individually dismissed by the user client-side. A <strong>details</strong> link redirects to the full status board.</p>
+<p>The <strong>Status Board</strong> at <code>/ssb/status</code> provides:</p>
+<ul>
+<li><strong>Active Alerts</strong> — non-expired alerts with severity badges, creator, and timestamp</li>
+<li><strong>Expired Alerts</strong> — historical record shown at reduced opacity</li>
+<li><strong>Post New Alert form</strong> — visible only to configured alert managers</li>
+</ul>
+<h3 id="severity-levels">Severity Levels</h3>
+<table>
+<thead>
+<tr>
+<th>Severity</th>
+<th>Colour</th>
+<th>Intended Use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>alarm</code></td>
+<td>Red</td>
+<td>Service outage or critical failure</td>
+</tr>
+<tr>
+<td><code>warning</code></td>
+<td>Amber</td>
+<td>Degraded performance, elevated error rate</td>
+</tr>
+<tr>
+<td><code>news</code></td>
+<td>Blue</td>
+<td>Release notes, planned maintenance</td>
+</tr>
+<tr>
+<td><code>info</code></td>
+<td>Slate</td>
+<td>General informational notices</td>
+</tr>
+</tbody>
+</table>
+<h3 id="creating-and-deleting-alerts">Creating and Deleting Alerts</h3>
+<p>Navigate to <strong>Status</strong> in the main chat header (or go to <code>/ssb/status</code> directly). The <strong>Post New Alert</strong> form is shown to users who have alert manager access. Fill in:</p>
+<ul>
+<li><strong>Message</strong> (required) — short text shown in the banner</li>
+<li><strong>Severity</strong> (required) — one of <code>alarm</code>, <code>warning</code>, <code>news</code>, <code>info</code></li>
+<li><strong>Description</strong> (optional) — longer explanation shown only on the status page</li>
+<li><strong>Expires at</strong> (optional) — datetime after which the alert is hidden from banners; expired alerts remain visible in the status board history</li>
+</ul>
+<p>To delete an alert, click the <strong>Delete</strong> button on its card on the status board. Deletion is permanent.</p>
+<p>Alerts can also be created via the REST API:</p>
+<pre><code class="language-bash">curl -X POST http://localhost:7861/api/ssb/alerts \
+  -H 'Content-Type: application/json' \
+  -d '{
+    &quot;severity&quot;: &quot;warning&quot;,
+    &quot;message&quot;: &quot;Embedding pipeline running — responses may be slower than usual&quot;,
+    &quot;description&quot;: &quot;Optional longer explanation shown on the status board.&quot;,
+    &quot;expires_in_hours&quot;: 4
+  }'
+</code></pre>
+<p>Or with an explicit expiry timestamp:</p>
+<pre><code class="language-bash">curl -X POST http://localhost:7861/api/ssb/alerts \
+  -H 'Content-Type: application/json' \
+  -d '{
+    &quot;severity&quot;: &quot;alarm&quot;,
+    &quot;message&quot;: &quot;Model backend unavailable&quot;,
+    &quot;expires_at&quot;: &quot;2026-02-21T18:00:00&quot;
+  }'
+</code></pre>
+<h3 id="api-endpoints">API Endpoints</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Route</th>
+<th>Auth Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET</code></td>
+<td><code>/ssb/status</code></td>
+<td>Any authenticated user</td>
+<td>Render the status board page</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/ssb/alerts</code></td>
+<td>Alert managers only</td>
+<td>Create a new alert</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/ssb/alerts/&lt;id&gt;</code></td>
+<td>Alert managers only</td>
+<td>Delete an alert by ID</td>
+</tr>
+</tbody>
+</table>
+<h3 id="access-control">Access Control</h3>
+<p>Alert managers are configured via <code>services.chat_app.alerts.managers</code> (username list) or the <code>alerts:manage</code> RBAC permission. The rules are:</p>
+<ol>
+<li><strong>Auth disabled</strong> → everyone may create and delete alerts.</li>
+<li><strong>Auth enabled</strong> → a user is an alert manager if <strong>either</strong>:<ul>
+<li>their username is in the <code>alerts.managers</code> list, <strong>or</strong></li>
+<li>their session roles grant the <code>alerts:manage</code> permission.</li>
+</ul>
+</li>
+<li><strong>Auth enabled, no username match, no <code>alerts:manage</code> permission</strong> → nobody may manage (safe default; a warning is logged).</li>
+</ol>
+<p>All users can always <em>view</em> alerts and the status board regardless of access level.</p>
+<pre><code class="language-yaml"># Username-based access (backwards compatible):
+services:
+  chat_app:
+    alerts:
+      managers:
+        - alice
+        - bob
+
+# Role-based access (can be combined with the above):
+services:
+  chat_app:
+    auth:
+      auth_roles:
+        roles:
+          ops-team:
+            permissions:
+              - alerts:manage
+</code></pre>
+<p>See <a href="../configuration/#serviceschat_appalerts">Configuration → <code>services.chat_app.alerts</code></a> for the full reference.</p>
+<hr />
 <h2 id="document-upload">Document Upload</h2>
 <p>Document upload is exposed in the chat UI and backed by the <strong>Data Manager</strong> service. Documents can be uploaded via the web interface or by copying files directly into the data directory.</p>
 <p>See <a href="../data_sources/#adding-documents-manually">Data Sources — Adding Documents Manually</a> for setup instructions.</p>
@@ -251,7 +399,7 @@
 <li>Provides a scheduling system for periodic re-ingestion</li>
 <li>Exposes API endpoints for ingestion status and schedule management</li>
 </ul>
-<h3 id="api-endpoints">API Endpoints</h3>
+<h3 id="api-endpoints_1">API Endpoints</h3>
 <table>
 <thead>
 <tr>

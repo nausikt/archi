@@ -70,6 +70,14 @@
     </li>
     <li class="toctree-l2"><a class="reference internal" href="#benchmarking">Benchmarking</a>
     </li>
+    <li class="toctree-l2"><a class="reference internal" href="#alerts-service-status-board">Alerts &amp; Service Status Board</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#for-all-users">For all users</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#for-alert-managers">For alert managers</a>
+    </li>
+        </ul>
+    </li>
     <li class="toctree-l2"><a class="reference internal" href="#admin-guide">Admin Guide</a>
         <ul>
     <li class="toctree-l3"><a class="reference internal" href="#becoming-an-admin">Becoming an Admin</a>
@@ -339,6 +347,28 @@ Archi supports several data ingestion methods:</p>
 <li><strong>RAGAS mode</strong>: Uses the Ragas evaluator for answer relevancy, faithfulness, context precision, and context relevancy</li>
 </ul>
 <p><strong><a href="../benchmarking/">Read more →</a></strong></p>
+<hr />
+<h2 id="alerts-service-status-board">Alerts &amp; Service Status Board</h2>
+<p>The <strong>Service Status Board (SSB)</strong> lets operators communicate service health, outages, maintenance windows, and general announcements to all users directly in the chat app.</p>
+<h3 id="for-all-users">For all users</h3>
+<ul>
+<li><strong>Alert banners</strong> appear at the top of every page when active alerts exist. Up to 5 banners are shown; each can be dismissed individually.</li>
+<li>The banner colour indicates severity: red (<code>alarm</code>), amber (<code>warning</code>), blue (<code>news</code>), slate (<code>info</code>).</li>
+<li>Click <strong>details</strong> on any banner, or navigate to <strong>Status</strong> in the header, to view the full <a href="/ssb/status">Service Status Board</a> with alert history.</li>
+</ul>
+<h3 id="for-alert-managers">For alert managers</h3>
+<p>Navigate to <code>/ssb/status</code> and use the <strong>Post New Alert</strong> form to create an alert. Required fields are <strong>Message</strong> and <strong>Severity</strong>. Optionally add an extended <strong>Description</strong> (shown only on the status page) and set an <strong>Expires at</strong> datetime for time-bounded notices.</p>
+<p>Delete alerts by clicking <strong>Delete</strong> on any alert card. Deletion is permanent; expired alerts remain in history until deleted.</p>
+<p>To grant alert manager access, add usernames to <code>services.chat_app.alerts.managers</code> in your config:</p>
+<pre><code class="language-yaml">services:
+  chat_app:
+    alerts:
+      managers:
+        - alice
+        - bob
+</code></pre>
+<p>If auth is disabled, all users can manage alerts. If auth is enabled and the managers list is absent or empty, nobody can manage alerts.</p>
+<p><strong><a href="../services/#service-status-board--alert-banners">Read more →</a></strong></p>
 <hr />
 <h2 id="admin-guide">Admin Guide</h2>
 <h3 id="becoming-an-admin">Becoming an Admin</h3>

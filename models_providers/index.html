@@ -172,7 +172,7 @@
                 <h1 id="models-providers">Models &amp; Providers</h1>
 <p>Archi uses a <strong>provider-based architecture</strong> for LLM access. Each provider wraps a specific LLM service and exposes a unified interface for model listing, connection validation, and chat model creation.</p>
 <h2 id="provider-architecture">Provider Architecture</h2>
-<p>All providers extend the <code>BaseProvider</code> abstract class and are registered in a global provider registry. The system supports five provider types:</p>
+<p>All providers extend the <code>BaseProvider</code> abstract class and are registered in a global provider registry. The system supports six provider types:</p>
 <table>
 <thead>
 <tr>
@@ -213,6 +213,13 @@
 <td><code>ChatOpenAI</code> (custom base URL)</td>
 </tr>
 <tr>
+<td>CERN LiteLLM</td>
+<td><code>cern_litellm</code></td>
+<td><code>CERN_LITELLM_API_KEY</code></td>
+<td>Configured via YAML</td>
+<td><code>ChatOpenAI</code> (CERN LLM Gateway)</td>
+</tr>
+<tr>
 <td>Local (Ollama/vLLM)</td>
 <td><code>local</code></td>
 <td>N/A</td>
@@ -223,7 +230,7 @@
 </table>
 <h3 id="key-concepts">Key Concepts</h3>
 <ul>
-<li><strong><code>ProviderType</code></strong>: An enum of supported provider names (<code>OPENAI</code>, <code>ANTHROPIC</code>, <code>GEMINI</code>, <code>OPENROUTER</code>, <code>LOCAL</code>).</li>
+<li><strong><code>ProviderType</code></strong>: An enum of supported provider names (<code>OPENAI</code>, <code>ANTHROPIC</code>, <code>GEMINI</code>, <code>OPENROUTER</code>, <code>LOCAL</code>, <code>CERN_LITELLM</code>).</li>
 <li><strong><code>ProviderConfig</code></strong>: A dataclass holding provider settings — type, API key, base URL, enabled state, models list, and extra kwargs.</li>
 <li><strong><code>ModelInfo</code></strong>: Describes a model's capabilities — context window, tool support, streaming support, vision support, and max output tokens.</li>
 <li><strong>Provider Registry</strong>: Providers are lazily registered at first use. Factory functions (<code>get_provider</code>, <code>get_model</code>) handle instantiation and caching.</li>

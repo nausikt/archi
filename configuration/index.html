@@ -86,6 +86,8 @@
         <ul>
     <li class="toctree-l3"><a class="reference internal" href="#serviceschat_app">services.chat_app</a>
         <ul>
+    <li class="toctree-l4"><a class="reference internal" href="#serviceschat_appalerts">services.chat_app.alerts</a>
+    </li>
     <li class="toctree-l4"><a class="reference internal" href="#provider-configuration">Provider Configuration</a>
     </li>
         </ul>
@@ -271,6 +273,12 @@
 <td>Default model</td>
 </tr>
 <tr>
+<td><code>client_timeout_seconds</code></td>
+<td>number</td>
+<td><code>600</code></td>
+<td>Chat request/stream timeout in seconds (sent to frontend as ms)</td>
+</tr>
+<tr>
 <td><code>tools</code></td>
 <td>dict</td>
 <td><code>{}</code></td>
@@ -318,8 +326,62 @@
 <td><code>false</code></td>
 <td>Enable authentication</td>
 </tr>
+<tr>
+<td><code>alerts.managers</code></td>
+<td>list</td>
+<td><code>[]</code></td>
+<td>Usernames allowed to create and delete alerts</td>
+</tr>
 </tbody>
 </table>
+<h4 id="serviceschat_appalerts"><code>services.chat_app.alerts</code></h4>
+<p>Controls access to the <a href="../services/#service-status-board--alert-banners">Service Status Board &amp; Alert Banners</a>.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>alerts.managers</code></td>
+<td>list of strings</td>
+<td><code>[]</code></td>
+<td>Usernames granted alert manager access</td>
+</tr>
+</tbody>
+</table>
+<p>Access rules (evaluated in order):</p>
+<ol>
+<li><strong>Auth disabled</strong> → all users may manage alerts.</li>
+<li><strong>Auth enabled</strong> → a user is an alert manager if <strong>either</strong>:<ul>
+<li>their username is in the <code>alerts.managers</code> list, <strong>or</strong></li>
+<li>their session roles grant the <code>alerts:manage</code> permission.</li>
+</ul>
+</li>
+<li><strong>Auth enabled, no username match, no <code>alerts:manage</code> permission</strong> → nobody may manage (safe default).</li>
+</ol>
+<pre><code class="language-yaml"># Option 1: explicit username list
+services:
+  chat_app:
+    alerts:
+      managers:
+        - alice
+        - bob
+
+# Option 2: role-based via RBAC (can be combined with Option 1)
+services:
+  chat_app:
+    auth:
+      auth_roles:
+        roles:
+          ops-team:
+            permissions:
+              - alerts:manage
+</code></pre>
 <h4 id="provider-configuration">Provider Configuration</h4>
 <pre><code class="language-yaml">services:
   chat_app:
