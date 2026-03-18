@@ -5,7 +5,7 @@ This service manages conversation storage with the PostgreSQL-consolidated schem
 storing model_used and pipeline_used directly instead of config foreign keys.
 """
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
 
@@ -134,7 +134,7 @@ class ConversationService:
                         m.content,
                         m.link or "",  # DB requires NOT NULL
                         m.context or "",  # DB requires NOT NULL
-                        m.ts or datetime.now(),
+                        m.ts or datetime.now(timezone.utc),
                         m.model_used,
                         m.pipeline_used,
                     )
@@ -331,7 +331,7 @@ class ConversationService:
             with conn.cursor() as cur:
                 cur.execute(
                     SQL_UPDATE_AB_PREFERENCE,
-                    (preference, datetime.now(), comparison_id)
+                    (preference, datetime.now(timezone.utc), comparison_id)
                 )
                 conn.commit()
         except Exception as e:

@@ -161,6 +161,7 @@ services:
       - ./configs:/root/archi/configs
       - ./data/prompts:/root/archi/data/prompts:ro
       - ./data/agents:/root/archi/agents
+      - ./data/skills:/root/archi/skills:ro
       {% for prompt_file in prompt_files | default([]) -%}
       - ./{{ prompt_file }}:/root/archi/{{ prompt_file }}
       {% endfor %}
@@ -283,6 +284,7 @@ services:
       - ./configs:/root/archi/configs
       - ./data/prompts:/root/archi/data/prompts:ro
       - ./data/agents:/root/archi/agents:ro
+      - ./data/skills:/root/archi/skills:ro
       {% for prompt_file in prompt_files | default([]) -%}
       - ./{{ prompt_file }}:/root/archi/{{ prompt_file }}
       {% endfor %}
@@ -344,6 +346,7 @@ services:
       - ./configs:/root/archi/configs
       - ./data/prompts:/root/archi/data/prompts:ro
       - ./data/agents:/root/archi/agents:ro
+      - ./data/skills:/root/archi/skills:ro
       {% for prompt_file in prompt_files | default([]) -%}
       - ./{{ prompt_file }}:/root/archi/{{ prompt_file }}
       {% endfor %}
@@ -403,6 +406,7 @@ services:
       - ./configs:/root/archi/configs
       - ./data/prompts:/root/archi/data/prompts:ro
       - ./data/agents:/root/archi/agents:ro
+      - ./data/skills:/root/archi/skills:ro
       {% for prompt_file in prompt_files | default([]) -%}
       - ./{{ prompt_file }}:/root/archi/{{ prompt_file }}
       {% endfor %}
@@ -464,6 +468,7 @@ services:
       - ./configs:/root/archi/configs
       - ./data/prompts:/root/archi/data/prompts:ro
       - ./data/agents:/root/archi/agents:ro
+      - ./data/skills:/root/archi/skills:ro
       {% for prompt_file in prompt_files | default([]) -%}
       - ./{{ prompt_file }}:/root/archi/{{ prompt_file }}
       {% endfor %}
@@ -522,6 +527,7 @@ services:
       - ./config.yaml:/root/archi/config.yaml
       - ./data/prompts:/root/archi/data/prompts:ro
       - ./data/agents:/root/archi/agents:ro
+      - ./data/skills:/root/archi/skills:ro
       {% for prompt_file in prompt_files | default([]) -%}
       - ./{{ prompt_file }}:/root/archi/{{ prompt_file }}
       {% endfor %}
@@ -599,6 +605,7 @@ services:
       - {{ benchmarking_dest }}:/root/archi/benchmarks
       - ./data/prompts:/root/archi/data/prompts:ro
       - ./data/agents:/root/archi/agents:ro
+      - ./data/skills:/root/archi/skills:ro
       {% for prompt_file in prompt_files | default([]) -%}
       - ./{{ prompt_file }}:/root/archi/{{ prompt_file }}
       {% endfor %}

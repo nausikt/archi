@@ -9,7 +9,7 @@ Provides REST API endpoints for:
 """
 import os
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import wraps
 from typing import List, Optional
 
@@ -1038,7 +1038,7 @@ def health_check():
         return jsonify({
             'status': 'healthy',
             'database': 'connected',
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
         }), 200
         
     except Exception as e:
@@ -1047,7 +1047,7 @@ def health_check():
             'status': 'unhealthy',
             'database': 'error',
             'error': str(e),
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
         }), 503
 
 

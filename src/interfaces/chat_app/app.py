@@ -5,7 +5,7 @@ import time
 import uuid
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Dict, Iterator, List, Optional
 from pathlib import Path
@@ -52,6 +52,8 @@ from src.utils.sql import (
     SQL_INSERT_CONVO, SQL_INSERT_FEEDBACK, SQL_INSERT_TIMING, SQL_QUERY_CONVO,
     SQL_CREATE_CONVERSATION, SQL_UPDATE_CONVERSATION_TIMESTAMP,
     SQL_LIST_CONVERSATIONS, SQL_GET_CONVERSATION_METADATA, SQL_DELETE_CONVERSATION,
+    SQL_LIST_CONVERSATIONS_BY_USER, SQL_GET_CONVERSATION_METADATA_BY_USER,
+    SQL_DELETE_CONVERSATION_BY_USER, SQL_UPDATE_CONVERSATION_TIMESTAMP_BY_USER,
     SQL_INSERT_TOOL_CALLS, SQL_QUERY_CONVO_WITH_FEEDBACK, SQL_DELETE_REACTION_FEEDBACK,
     SQL_GET_REACTION_FEEDBACK,
     SQL_INSERT_AB_COMPARISON, SQL_UPDATE_AB_PREFERENCE, SQL_GET_AB_COMPARISON,
@@ -60,7 +62,24 @@ from src.utils.sql import (
     SQL_GET_TRACE_BY_MESSAGE, SQL_GET_ACTIVE_TRACE, SQL_CANCEL_ACTIVE_TRACES,
 )
 from src.interfaces.chat_app.document_utils import *
+from src.interfaces.chat_app.service_alerts import (
+    register_service_alerts, get_active_banner_alerts, is_alert_manager,
+)
 from src.interfaces.chat_app.utils import collapse_assistant_sequences
+from src.utils.user_service import UserService
+
+# RBAC imports for role-based access control
+from src.utils.rbac import (
+    Permission,
+    get_registry,
+    get_user_roles,
+    has_permission,
+    require_permission,
+    require_any_permission,
+    require_authenticated,
+)
+from src.utils.rbac.permissions import get_permission_context
+from src.utils.rbac.audit import log_authentication_event
 
 
 logger = get_logger(__name__)
@@ -89,6 +108,41 @@ def _build_provider_config_from_payload(config_payload: Dict[str, Any], provider
         extra_kwargs=extra,
     )
 
+
+def _is_provider_enabled_in_config(
+    config_payload: Dict[str, Any],
+    provider_type: Optional[ProviderType] = None,
+    provider_name: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """
+    Return whether a provider is explicitly enabled by chat_app config.
+
+    Only explicit `enabled: false` inside `services.chat_app.providers.<provider>`
+    disables request-time overrides. Missing provider blocks remain allowed for
+    backward compatibility.
+
+    Exactly one of `provider_type` or `provider_name` should be provided.
+    Unknown provider names are treated as enabled here; other validation paths
+    handle invalid provider types.
+    """
+    if provider_type is None and provider_name:
+        try:
+            provider_type = ProviderType(str(provider_name).lower())
+        except ValueError:
+            return True, None
+    if provider_type is None:
+        return True, None
+
+    services_cfg = config_payload.get("services", {}) if isinstance(config_payload, dict) else {}
+    chat_cfg = services_cfg.get("chat_app", {}) if isinstance(services_cfg, dict) else {}
+    providers_cfg = chat_cfg.get("providers", {}) if isinstance(chat_cfg, dict) else {}
+    provider_cfg = providers_cfg.get(provider_type.value, {})
+
+    if isinstance(provider_cfg, dict) and provider_cfg.get("enabled") is False:
+        return False, f"Provider '{provider_type.value}' is disabled in services.chat_app.providers.{provider_type.value}.enabled"
+    return True, None
+
+
 def _config_names():
     cfg = get_full_config()
     return [cfg.get("name", "default")]
@@ -99,6 +153,10 @@ MAIN_PROMPT_FILE = "/root/archi/main.prompt"
 CONDENSE_PROMPT_FILE = "/root/archi/condense.prompt"
 SUMMARY_PROMPT_FILE = "/root/archi/summary.prompt"
 ARCHI_SENDER = "archi"
+CLIENT_TIMEOUT_ERROR_MESSAGE = (
+    "client timeout; the agent wasn't able to find satisfactory information "
+    "to respond to the query within the time limit set by the administrator."
+)
 
 
 class AnswerRenderer(mt.HTMLRenderer):
@@ -227,6 +285,12 @@ class ChatWrapper:
         if not agent_class:
             raise ValueError("services.chat_app.agent_class must be configured.")
         default_provider = chat_cfg.get("default_provider")
+        is_enabled, disabled_reason = _is_provider_enabled_in_config(self.config, provider_name=default_provider)
+        if not is_enabled:
+            raise ValueError(
+                f"services.chat_app.default_provider='{str(default_provider).lower()}' is invalid because it is disabled. "
+                f"{disabled_reason}"
+            )
         default_model = chat_cfg.get("default_model")
         prompt_overrides = chat_cfg.get("prompts", {})
 
@@ -297,6 +361,15 @@ class ChatWrapper:
         agent_class = chat_cfg.get("agent_class") or chat_cfg.get("pipeline")
         if not agent_class:
             raise ValueError("services.chat_app.agent_class must be configured.")
+        is_enabled, disabled_reason = _is_provider_enabled_in_config(
+            config_payload, provider_name=chat_cfg.get("default_provider")
+        )
+        if not is_enabled:
+            default_provider = str(chat_cfg.get("default_provider")).lower()
+            raise ValueError(
+                f"services.chat_app.default_provider='{default_provider}' is invalid because it is disabled. "
+                f"{disabled_reason}"
+            )
 
         model_name = self._extract_model_name(config_payload)
         
@@ -373,7 +446,7 @@ class ChatWrapper:
 
     def get_top_sources(self, documents, scores):
         """
-        Build a list of top reference entries (link or ticket id).
+        Build a de-duplicated list of reference entries (link or ticket id).
         """
         if scores:
             sorted_indices = np.argsort(scores)
@@ -415,55 +488,70 @@ class ChatWrapper:
                 }
             )
 
-            if len(top_sources) >= 5:
-                break
-
         logger.debug(f"Top sources: {top_sources}")
         return top_sources
 
     @staticmethod
+    def _format_source_entry(entry):
+        score = entry["score"]
+        link = entry["link"]
+        display_name = entry["display"]
+
+        if score == -1.0 or score == "N/A":
+            score_str = ""
+        else:
+            score_str = f" ({score:.2f})"
+
+        if link:
+            return f"- [{display_name}]({link}){score_str}\n"
+        return f"- {display_name}{score_str}\n"
+
+    @staticmethod
     def format_links(top_sources):
         _output = ""
+        if not top_sources:
+            return _output
 
-        if top_sources:
-            _output += '''
-            <div style="
-                margin-top: 1.5em;
-                padding-top: 0.5em;
-                border-top: 1px solid rgba(255, 255, 255, 0.1);
-                font-size: 0.75em;
-                color: #adb5bd;
-                line-height: 1.3;
-            ">
-                <div style="margin-bottom: 0.3em; font-weight: 500;">Sources:</div>
+        _output += '''
+        <div style="
+            margin-top: 1.5em;
+            padding-top: 0.5em;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            font-size: 0.75em;
+            color: #adb5bd;
+            line-height: 1.3;
+        ">
+        '''
+
+        def _entry_html(entry):
+            score = entry["score"]
+            link = entry["link"]
+            display_name = entry["display"]
+
+            if score == -1.0 or score == "N/A":
+                score_str = ""
+            else:
+                score_str = f"({score:.2f})"
+
+            if link:
+                reference_html = f"<a href=\"{link}\" target=\"_blank\" rel=\"noopener noreferrer\" style=\"color: #66b3ff; text-decoration: none;\" onmouseover=\"this.style.textDecoration='underline'\" onmouseout=\"this.style.textDecoration='none'\">{display_name}</a>"
+            else:
+                reference_html = f"<span style=\"color: #66b3ff;\">{display_name}</span>"
+
+            return f'''
+                <div style="margin: 0.15em 0; display: flex; align-items: center; gap: 0.4em;">
+                    <span>•</span>
+                    {reference_html}
+                    <span style="color: #6c757d; font-size: 0.9em;">{score_str}</span>
+                </div>
             '''
 
-            for entry in top_sources:
-                score = entry["score"]
-                link = entry["link"]
-                display_name = entry["display"]
-                
-                # Format score: show nothing for -1 (placeholder), otherwise show numeric value
-                if score == -1.0 or score == "N/A":
-                    score_str = ""
-                else:
-                    score_str = f"({score:.2f})"
+        _output += f'<details style="margin-top: 0.4em;"><summary style="cursor: pointer; color: #66b3ff; font-weight: 700;">Show all sources ({len(top_sources)})</summary>'
+        for entry in top_sources:
+            _output += _entry_html(entry)
+        _output += '</details>'
 
-                if link:
-                    reference_html = f"<a href=\"{link}\" target=\"_blank\" rel=\"noopener noreferrer\" style=\"color: #66b3ff; text-decoration: none;\" onmouseover=\"this.style.textDecoration='underline'\" onmouseout=\"this.style.textDecoration='none'\">{display_name}</a>"
-                else:
-                    reference_html = f"<span style=\"color: #66b3ff;\">{display_name}</span>"
-
-                _output += f'''
-                    <div style="margin: 0.15em 0; display: flex; align-items: center; gap: 0.4em;">
-                        <span>•</span>
-                        {reference_html}
-                        <span style="color: #6c757d; font-size: 0.9em;">{score_str}</span>
-                    </div>
-                '''
-
-            _output += '</div>'
-
+        _output += '</div>'
         return _output
 
     @staticmethod
@@ -472,23 +560,10 @@ class ChatWrapper:
         if not top_sources:
             return ""
 
-        _output = "\n\n---\n**Sources:**\n"
-
+        _output = f"\n\n---\n<details><summary><strong>Show all sources ({len(top_sources)})</strong></summary>\n\n"
         for entry in top_sources:
-            score = entry["score"]
-            link = entry["link"]
-            display_name = entry["display"]
-
-            # Format score: show nothing for -1 (placeholder), otherwise show numeric value
-            if score == -1.0 or score == "N/A":
-                score_str = ""
-            else:
-                score_str = f" ({score:.2f})"
-
-            if link:
-                _output += f"- [{display_name}]({link}){score_str}\n"
-            else:
-                _output += f"- {display_name}{score_str}\n"
+            _output += ChatWrapper._format_source_entry(entry)
+        _output += "\n</details>\n"
 
         return _output
 
@@ -656,7 +731,7 @@ class ChatWrapper:
         try:
             cursor.execute(
                 SQL_UPDATE_AB_PREFERENCE,
-                (preference, datetime.now(), comparison_id)
+                (preference, datetime.now(timezone.utc), comparison_id)
             )
             conn.commit()
             logger.info(f"Updated A/B comparison {comparison_id} with preference '{preference}'")
@@ -968,7 +1043,7 @@ class ChatWrapper:
             conn.close()
 
 
-    def query_conversation_history(self, conversation_id, client_id):
+    def query_conversation_history(self, conversation_id, client_id, user_id: Optional[str] = None):
         """
         Return the conversation history as an ordered list of tuples. The order
         is determined by ascending message_id. Each tuple contains the sender and
@@ -978,8 +1053,11 @@ class ChatWrapper:
         conn = psycopg2.connect(**self.pg_config)
         cursor = conn.cursor()
 
-        # ensure conversation belongs to client before querying
-        cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
+        # ensure conversation belongs to user/client before querying
+        if user_id:
+            cursor.execute(SQL_GET_CONVERSATION_METADATA_BY_USER, (conversation_id, user_id, client_id))
+        else:
+            cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
         metadata = cursor.fetchone()
         if metadata is None:
             cursor.close()
@@ -997,7 +1075,7 @@ class ChatWrapper:
 
         return history
 
-    def create_conversation(self, first_message: str, client_id: str) -> int:
+    def create_conversation(self, first_message: str, client_id: str, user_id: Optional[str] = None) -> int:
         """
         Gets first message (activates a new conversation), and generates a title w/ first msg.
         (TODO: commercial ones use one-sentence summarizer to make the title)
@@ -1007,12 +1085,12 @@ class ChatWrapper:
         """
         service = "Chatbot"
         title = first_message[:20] + ("..." if len(first_message) > 20 else "")
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         
         version = os.getenv("APP_VERSION", "unknown")
 
-        # title, created_at, last_message_at, version
-        insert_tup = (title, now, now, client_id, version)
+        # title, created_at, last_message_at, client_id, version, user_id
+        insert_tup = (title, now, now, client_id, version, user_id)
 
         # create connection to database (use local vars for thread safety)
         conn = psycopg2.connect(**self.pg_config)
@@ -1028,19 +1106,22 @@ class ChatWrapper:
         logger.info(f"Created new conversation with ID: {conversation_id}")
         return conversation_id
 
-    def update_conversation_timestamp(self, conversation_id: int, client_id: str):
+    def update_conversation_timestamp(self, conversation_id: int, client_id: str, user_id: Optional[str] = None):
         """
         Update the last_message_at timestamp for a conversation.
         last_message_at is used to reorder conversations in the UI (on vertical sidebar).
         """
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
         # create connection to database (use local vars for thread safety)
         conn = psycopg2.connect(**self.pg_config)
         cursor = conn.cursor()
 
         # update timestamp
-        cursor.execute(SQL_UPDATE_CONVERSATION_TIMESTAMP, (now, conversation_id, client_id))
+        if user_id:
+            cursor.execute(SQL_UPDATE_CONVERSATION_TIMESTAMP_BY_USER, (now, conversation_id, user_id, client_id))
+        else:
+            cursor.execute(SQL_UPDATE_CONVERSATION_TIMESTAMP, (now, conversation_id, client_id))
         conn.commit()
 
         # clean up database connection state
@@ -1169,9 +1250,9 @@ class ChatWrapper:
                     try:
                         ts = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
                     except (ValueError, TypeError):
-                        ts = datetime.now()
+                        ts = datetime.now(timezone.utc)
                 else:
-                    ts = datetime.now()
+                    ts = datetime.now(timezone.utc)
 
                 for tc in msg.tool_calls:
                     tool_call_id = tc.get("id", "")
@@ -1188,7 +1269,7 @@ class ChatWrapper:
             tool_result = tc.get("result", "")
             if len(tool_result) > 500:
                 tool_result = tool_result[:500] + "..."
-            ts = tool_call_timestamps.get(tool_call_id, datetime.now())
+            ts = tool_call_timestamps.get(tool_call_id, datetime.now(timezone.utc))
 
             insert_tups.append((
                 conversation_id,
@@ -1212,8 +1293,8 @@ class ChatWrapper:
 
     def _init_timestamps(self) -> Dict[str, datetime]:
         return {
-            "lock_acquisition_ts": datetime.now(),
-            "vectorstore_update_ts": datetime.now(),
+            "lock_acquisition_ts": datetime.now(timezone.utc),
+            "vectorstore_update_ts": datetime.now(timezone.utc),
         }
 
     def _resolve_config_name(self, config_name: Optional[str]) -> str:
@@ -1234,8 +1315,13 @@ class ChatWrapper:
         try:
             from src.archi.providers import get_provider
 
+            provider_type = ProviderType(provider)
+            is_enabled, disabled_reason = _is_provider_enabled_in_config(self.config, provider_type)
+            if not is_enabled:
+                raise ValueError(disabled_reason or f"Provider '{provider}' is disabled by configuration")
+
             # Build provider config from YAML so base_url/mode/default_model are respected
-            cfg = _build_provider_config_from_payload(self.config, ProviderType(provider))
+            cfg = _build_provider_config_from_payload(self.config, provider_type)
             provider_instance = get_provider(provider, config=cfg, use_cache=False) if cfg else get_provider(provider)
             if api_key:
                 provider_instance.set_api_key(api_key)
@@ -1257,19 +1343,20 @@ class ChatWrapper:
         client_sent_msg_ts: float,
         client_timeout: float,
         timestamps: Dict[str, datetime],
+        user_id: Optional[str] = None,
     ) -> tuple[Optional[ChatRequestContext], Optional[int]]:
         if not client_id:
             raise ValueError("client_id is required to process chat messages")
         sender, content = tuple(message[0])
 
         if conversation_id is None:
-            conversation_id = self.create_conversation(content, client_id)
+            conversation_id = self.create_conversation(content, client_id, user_id)
             history = []
         else:
-            history = self.query_conversation_history(conversation_id, client_id)
-            self.update_conversation_timestamp(conversation_id, client_id)
+            history = self.query_conversation_history(conversation_id, client_id, user_id)
+            self.update_conversation_timestamp(conversation_id, client_id, user_id)
 
-        timestamps["query_convo_history_ts"] = datetime.now()
+        timestamps["query_convo_history_ts"] = datetime.now(timezone.utc)
 
         if is_refresh:
             while history and history[-1][0] == ARCHI_SENDER:
@@ -1407,7 +1494,7 @@ class ChatWrapper:
         else:
             output += self.format_links_markdown(top_sources)
 
-        timestamps["archi_message_ts"] = datetime.now()
+        timestamps["archi_message_ts"] = datetime.now(timezone.utc)
         context_data = self.prepare_context_for_storage(documents, scores)
 
         best_reference = "Link unavailable"
@@ -1425,7 +1512,7 @@ class ChatWrapper:
             context_data,
             context.is_refresh,
         )
-        timestamps["insert_convo_ts"] = datetime.now()
+        timestamps["insert_convo_ts"] = datetime.now(timezone.utc)
         context.history.append((ARCHI_SENDER, result["answer"]))
 
         agent_messages = getattr(result, "messages", []) or []
@@ -1448,7 +1535,7 @@ class ChatWrapper:
 
         return output, message_ids
 
-    def __call__(self, message: List[str], conversation_id: int|None, client_id: str, is_refresh: bool, server_received_msg_ts: datetime,  client_sent_msg_ts: float, client_timeout: float, config_name: str):
+    def __call__(self, message: List[str], conversation_id: int|None, client_id: str, is_refresh: bool, server_received_msg_ts: datetime,  client_sent_msg_ts: float, client_timeout: float, config_name: str, user_id: Optional[str] = None):
         """
         Execute the chat functionality.
         """
@@ -1467,6 +1554,7 @@ class ChatWrapper:
                 client_sent_msg_ts,
                 client_timeout,
                 timestamps,
+                user_id=user_id,
             )
             if error_code is not None:
                 return None, None, None, timestamps, error_code
@@ -1475,7 +1563,7 @@ class ChatWrapper:
             self.update_config(config_name=requested_config)
 
             result = self.archi(history=context.history, conversation_id=context.conversation_id)
-            timestamps["chain_finished_ts"] = datetime.now()
+            timestamps["chain_finished_ts"] = datetime.now(timezone.utc)
 
             # keep track of total number of queries and log this amount
             self.number_of_queries += 1
@@ -1502,7 +1590,7 @@ class ChatWrapper:
             if self.conn is not None:
                 self.conn.close()
 
-        timestamps['finish_call_ts'] = datetime.now()
+        timestamps['finish_call_ts'] = datetime.now(timezone.utc)
 
         return output, context.conversation_id if context else None, message_ids, timestamps, None
 
@@ -1523,6 +1611,7 @@ class ChatWrapper:
         provider: str = None,
         model: str = None,
         provider_api_key: str = None,
+        user_id: Optional[str] = None,
     ) -> Iterator[Dict[str, Any]]:
         timestamps = self._init_timestamps()
         context = None
@@ -1532,6 +1621,44 @@ class ChatWrapper:
         trace_events: List[Dict[str, Any]] = []
         tool_call_count = 0
         stream_start_time = time.time()
+        emitted_tool_call_ids = set()
+        emitted_tool_start_ids = set()
+        pending_tool_call_ids: List[str] = []
+        tool_calls_by_id: Dict[str, Dict[str, Any]] = {}
+        synthetic_tool_counter = 0
+
+        def _next_tool_call_id(tool_name: str) -> str:
+            nonlocal synthetic_tool_counter
+            synthetic_tool_counter += 1
+            safe_name = re.sub(r"[^a-zA-Z0-9_]+", "_", (tool_name or "unknown")).strip("_") or "unknown"
+            return f"synthetic_tool_{synthetic_tool_counter}_{safe_name}"
+
+        def _is_empty_tool_args(tool_args: Any) -> bool:
+            return tool_args in (None, "", {}, [])
+
+        def _has_meaningful_tool_payload(tool_name: Any, tool_args: Any) -> bool:
+            if isinstance(tool_name, str) and tool_name.strip() and tool_name.strip().lower() != "unknown":
+                return True
+            return not _is_empty_tool_args(tool_args)
+
+        def _remember_tool_call(tool_call_id: str, tool_name: Any, tool_args: Any) -> None:
+            if not tool_call_id:
+                return
+            current = tool_calls_by_id.get(tool_call_id, {})
+            current_name = current.get("tool_name", "unknown")
+            current_args = current.get("tool_args", {})
+            merged_name = (
+                tool_name
+                if isinstance(tool_name, str)
+                and tool_name.strip()
+                and tool_name.strip().lower() != "unknown"
+                else current_name
+            )
+            merged_args = tool_args if not _is_empty_tool_args(tool_args) else current_args
+            tool_calls_by_id[tool_call_id] = {
+                "tool_name": merged_name or "unknown",
+                "tool_args": merged_args,
+            }
 
         try:
             context, error_code = self._prepare_chat_context(
@@ -1543,11 +1670,12 @@ class ChatWrapper:
                 client_sent_msg_ts,
                 client_timeout,
                 timestamps,
+                user_id=user_id,
             )
             if error_code is not None:
                 error_message = "server error; see chat logs for message"
                 if error_code == 408:
-                    error_message = "client timeout"
+                    error_message = CLIENT_TIMEOUT_ERROR_MESSAGE
                 elif error_code == 403:
                     error_message = "conversation not found"
                 yield {"type": "error", "status": error_code, "message": error_message}
@@ -1567,6 +1695,11 @@ class ChatWrapper:
                         if hasattr(self.archi.pipeline, 'refresh_agent'):
                             self.archi.pipeline.refresh_agent(force=True)
                         logger.info(f"Overrode pipeline LLM with {provider}/{model}")
+                        self.current_model_used = f"{provider}/{model}"
+                except ValueError as e:
+                    logger.warning(f"Failed to create provider LLM {provider}/{model}: {e}")
+                    yield {"type": "error", "status": 400, "message": str(e)}
+                    return
                 except Exception as e:
                     logger.warning(f"Failed to create provider LLM {provider}/{model}: {e}")
                     yield {"type": "warning", "message": f"Using default model: {e}"}
@@ -1591,7 +1724,7 @@ class ChatWrapper:
                             cancellation_reason='Client timeout',
                             total_duration_ms=total_duration_ms,
                         )
-                    yield {"type": "error", "status": 408, "message": "client timeout"}
+                    yield {"type": "error", "status": 408, "message": CLIENT_TIMEOUT_ERROR_MESSAGE}
                     return
                 last_output = output
                 
@@ -1604,20 +1737,96 @@ class ChatWrapper:
                     tool_messages = getattr(output, "messages", []) or []
                     tool_message = tool_messages[0] if tool_messages else None
                     tool_calls = getattr(tool_message, "tool_calls", None) if tool_message else None
+                    memory_args_by_id = {}
+                    if output.metadata:
+                        memory_args_by_id = output.metadata.get("tool_inputs_by_id", {}) or {}
+                    raw_args_by_id: Dict[str, Any] = {}
+                    raw_name_by_id: Dict[str, str] = {}
+                    if tool_message is not None:
+                        try:
+                            additional = getattr(tool_message, "additional_kwargs", {}) or {}
+                            raw_tool_calls = additional.get("tool_calls") or []
+                            for raw_call in raw_tool_calls:
+                                if not isinstance(raw_call, dict):
+                                    continue
+                                raw_id = raw_call.get("id")
+                                function_obj = raw_call.get("function") or {}
+                                raw_name = function_obj.get("name")
+                                raw_arguments = function_obj.get("arguments")
+                                parsed_args: Any = None
+                                if isinstance(raw_arguments, str) and raw_arguments.strip():
+                                    try:
+                                        parsed_args = json.loads(raw_arguments)
+                                    except Exception:
+                                        parsed_args = {"_raw_arguments": raw_arguments}
+                                elif isinstance(raw_arguments, dict):
+                                    parsed_args = raw_arguments
+                                if raw_id and parsed_args is not None:
+                                    raw_args_by_id[raw_id] = parsed_args
+                                if raw_id and isinstance(raw_name, str) and raw_name.strip():
+                                    raw_name_by_id[raw_id] = raw_name.strip()
+
+                            # Newer OpenAI/LangChain payloads may carry partial tool calls here.
+                            for chunk in getattr(tool_message, "tool_call_chunks", []) or []:
+                                if not isinstance(chunk, dict):
+                                    continue
+                                chunk_id = chunk.get("id")
+                                chunk_name = chunk.get("name")
+                                chunk_args = chunk.get("args")
+                                parsed_chunk_args: Any = None
+                                if isinstance(chunk_args, str) and chunk_args.strip():
+                                    try:
+                                        parsed_chunk_args = json.loads(chunk_args)
+                                    except Exception:
+                                        parsed_chunk_args = {"_raw_arguments": chunk_args}
+                                elif isinstance(chunk_args, dict):
+                                    parsed_chunk_args = chunk_args
+                                if chunk_id and parsed_chunk_args is not None:
+                                    raw_args_by_id[chunk_id] = parsed_chunk_args
+                                if chunk_id and isinstance(chunk_name, str) and chunk_name.strip():
+                                    raw_name_by_id[chunk_id] = chunk_name.strip()
+                        except Exception:
+                            pass
                     if tool_calls:
                         for tool_call in tool_calls:
+                            tool_call_id = tool_call.get("id", "")
+                            tool_args = tool_call.get("args", {})
+                            if _is_empty_tool_args(tool_args):
+                                tool_args = raw_args_by_id.get(tool_call_id, tool_args)
+                            if _is_empty_tool_args(tool_args):
+                                fallback = memory_args_by_id.get(tool_call_id, {})
+                                if isinstance(fallback, dict):
+                                    tool_args = fallback.get("tool_input", tool_args)
+                            tool_name = tool_call.get("name", "unknown")
+                            if (not tool_name or str(tool_name).strip().lower() == "unknown") and tool_call_id in raw_name_by_id:
+                                tool_name = raw_name_by_id[tool_call_id]
+                            if (not tool_name) and isinstance(memory_args_by_id.get(tool_call_id), dict):
+                                tool_name = memory_args_by_id[tool_call_id].get("tool_name", "unknown")
+                            if (not tool_call_id) and (not _has_meaningful_tool_payload(tool_name, tool_args)):
+                                continue
+                            if not tool_call_id:
+                                tool_call_id = _next_tool_call_id(tool_name)
+                            _remember_tool_call(tool_call_id, tool_name, tool_args)
+                            if tool_call_id in emitted_tool_call_ids:
+                                continue
+                            emitted_tool_call_ids.add(tool_call_id)
+                            pending_tool_call_ids.append(tool_call_id)
                             tool_call_count += 1
-                            trace_event = {
-                                "type": "tool_start",
-                                "tool_call_id": tool_call.get("id", ""),
-                                "tool_name": tool_call.get("name", "unknown"),
-                                "tool_args": tool_call.get("args", {}),
-                                "timestamp": timestamp,
-                                "conversation_id": context.conversation_id,
-                            }
-                            trace_events.append(trace_event)
-                            if include_tool_steps:
-                                yield trace_event
+                    elif memory_args_by_id:
+                        for memory_id, memory_call in memory_args_by_id.items():
+                            if not isinstance(memory_call, dict):
+                                continue
+                            tool_name = memory_call.get("tool_name", "unknown")
+                            tool_args = memory_call.get("tool_input", {})
+                            if not _has_meaningful_tool_payload(tool_name, tool_args):
+                                continue
+                            tool_call_id = memory_id or _next_tool_call_id(tool_name)
+                            if tool_call_id in emitted_tool_call_ids:
+                                continue
+                            emitted_tool_call_ids.add(tool_call_id)
+                            pending_tool_call_ids.append(tool_call_id)
+                            _remember_tool_call(tool_call_id, tool_name, tool_args)
+                            tool_call_count += 1
                         
                 elif event_type == "tool_output":
                     tool_messages = getattr(output, "messages", []) or []
@@ -1627,9 +1836,39 @@ class ChatWrapper:
                     full_length = len(tool_output) if truncated else None
                     display_output = self._truncate_text(tool_output, max_step_chars)
                     
+                    output_tool_call_id = getattr(tool_message, "tool_call_id", "") if tool_message else ""
+                    if not output_tool_call_id and pending_tool_call_ids:
+                        output_tool_call_id = pending_tool_call_ids.pop(0)
+                    elif output_tool_call_id in pending_tool_call_ids:
+                        pending_tool_call_ids.remove(output_tool_call_id)
+
+                    # Emit tool_start once, immediately before first output for stable ordering.
+                    if output_tool_call_id and output_tool_call_id not in emitted_tool_start_ids:
+                        memory_args_by_id = output.metadata.get("tool_inputs_by_id", {}) if output.metadata else {}
+                        fallback = memory_args_by_id.get(output_tool_call_id, {})
+                        fallback_name = "unknown"
+                        fallback_args: Any = {}
+                        if isinstance(fallback, dict):
+                            fallback_name = fallback.get("tool_name", "unknown")
+                            fallback_args = fallback.get("tool_input", {})
+                        _remember_tool_call(output_tool_call_id, fallback_name, fallback_args)
+                        call_info = tool_calls_by_id.get(output_tool_call_id, {})
+                        start_event = {
+                            "type": "tool_start",
+                            "tool_call_id": output_tool_call_id,
+                            "tool_name": call_info.get("tool_name", "unknown"),
+                            "tool_args": call_info.get("tool_args", {}),
+                            "timestamp": timestamp,
+                            "conversation_id": context.conversation_id,
+                        }
+                        trace_events.append(start_event)
+                        emitted_tool_start_ids.add(output_tool_call_id)
+                        if include_tool_steps:
+                            yield start_event
+
                     trace_event = {
                         "type": "tool_output",
-                        "tool_call_id": getattr(tool_message, "tool_call_id", "") if tool_message else "",
+                        "tool_call_id": output_tool_call_id,
                         "output": display_output,
                         "truncated": truncated,
                         "full_length": full_length,
@@ -1729,7 +1968,7 @@ class ChatWrapper:
                                     "conversation_id": context.conversation_id,
                                 }
 
-            timestamps["chain_finished_ts"] = datetime.now()
+            timestamps["chain_finished_ts"] = datetime.now(timezone.utc)
 
             if last_output is None:
                 if trace_id:
@@ -1742,6 +1981,20 @@ class ChatWrapper:
                     )
                 yield {"type": "error", "status": 500, "message": "server error; see chat logs for message"}
                 return
+
+                # For providers like gpt-5, streamed tool chunks may carry empty args while
+                # the final AI message contains full tool arguments. Backfill before final.
+                try:
+                    final_tool_calls = last_output.extract_tool_calls() if hasattr(last_output, "extract_tool_calls") else []
+                    for tc in final_tool_calls:
+                        tool_call_id = tc.get("id", "")
+                        tool_name = tc.get("name", "unknown")
+                        tool_args = tc.get("args", {})
+                        if not tool_call_id or _is_empty_tool_args(tool_args):
+                            continue
+                        _remember_tool_call(tool_call_id, tool_name, tool_args)
+                except Exception:
+                    pass
                 
             # keep track of total number of queries and log this amount
             self.number_of_queries += 1
@@ -1755,10 +2008,10 @@ class ChatWrapper:
                 render_markdown=False,  # Client renders with marked.js
             )
 
-            timestamps["finish_call_ts"] = datetime.now()
+            timestamps["finish_call_ts"] = datetime.now(timezone.utc)
             timestamps["server_received_msg_ts"] = server_received_msg_ts
-            timestamps["client_sent_msg_ts"] = datetime.fromtimestamp(client_sent_msg_ts)
-            timestamps["server_response_msg_ts"] = datetime.now()
+            timestamps["client_sent_msg_ts"] = datetime.fromtimestamp(client_sent_msg_ts, tz=timezone.utc)
+            timestamps["server_response_msg_ts"] = datetime.now(timezone.utc)
 
             if message_ids:
                 self.insert_timing(message_ids[-1], timestamps)
@@ -1805,9 +2058,10 @@ class ChatWrapper:
                 "user_message_id": message_ids[0] if message_ids and len(message_ids) > 1 else None,
                 "trace_id": trace_id,
                 "server_response_msg_ts": timestamps["server_response_msg_ts"].timestamp(),
-                "final_response_msg_ts": datetime.now().timestamp(),
+                "final_response_msg_ts": datetime.now(timezone.utc).timestamp(),
                 "usage": usage,
                 "model": model,
+                "model_used": self.current_model_used,
             }
 
         except GeneratorExit:
@@ -1923,6 +2177,17 @@ class FlaskAppWrapper(object):
         # enable CORS:
         CORS(self.app)
 
+        # inject active alerts into every template context
+        @self.app.context_processor
+        def _inject_alerts():
+            if not session.get('logged_in'):
+                return dict(active_banner_alerts=[], is_alert_manager=False)
+            alerts = get_active_banner_alerts()
+            return dict(
+                active_banner_alerts=alerts,
+                is_alert_manager=is_alert_manager(),
+            )
+
         # add endpoints for flask app
         # Public endpoints (no auth required)
         self.add_endpoint('/', 'landing', self.landing)
@@ -1935,7 +2200,8 @@ class FlaskAppWrapper(object):
         self.add_endpoint('/terms', 'terms', self.require_auth(self.terms))
         self.add_endpoint('/api/like', 'like', self.require_auth(self.like),  methods=["POST"])
         self.add_endpoint('/api/dislike', 'dislike', self.require_auth(self.dislike),  methods=["POST"])
-        self.add_endpoint('/api/update_config', 'update_config', self.require_auth(self.update_config), methods=["POST"])
+        # Config modification requires config:modify permission (archi-expert or archi-admins)
+        self.add_endpoint('/api/update_config', 'update_config', self.require_perm(Permission.Config.MODIFY)(self.update_config), methods=["POST"])
         self.add_endpoint('/api/get_configs', 'get_configs', self.require_auth(self.get_configs), methods=["GET"])
         self.add_endpoint('/api/text_feedback', 'text_feedback', self.require_auth(self.text_feedback), methods=["POST"])
 
@@ -1976,40 +2242,52 @@ class FlaskAppWrapper(object):
         self.add_endpoint('/api/agents/active', 'set_active_agent', self.require_auth(self.set_active_agent), methods=["POST"])
 
         # Data viewer endpoints
+        # View data page and list documents - requires documents:view permission
+        # Enable/disable documents - requires documents:select permission
         logger.info("Adding data viewer API endpoints")
-        self.add_endpoint('/data', 'data_viewer', self.require_auth(self.data_viewer_page))
-        self.add_endpoint('/api/data/documents', 'list_data_documents', self.require_auth(self.list_data_documents), methods=["GET"])
-        self.add_endpoint('/api/data/documents/<document_hash>/content', 'get_data_document_content', self.require_auth(self.get_data_document_content), methods=["GET"])
-        self.add_endpoint('/api/data/documents/<document_hash>/chunks', 'get_data_document_chunks', self.require_auth(self.get_data_document_chunks), methods=["GET"])
-        self.add_endpoint('/api/data/documents/<document_hash>/enable', 'enable_data_document', self.require_auth(self.enable_data_document), methods=["POST"])
-        self.add_endpoint('/api/data/documents/<document_hash>/disable', 'disable_data_document', self.require_auth(self.disable_data_document), methods=["POST"])
-        self.add_endpoint('/api/data/bulk-enable', 'bulk_enable_documents', self.require_auth(self.bulk_enable_documents), methods=["POST"])
-        self.add_endpoint('/api/data/bulk-disable', 'bulk_disable_documents', self.require_auth(self.bulk_disable_documents), methods=["POST"])
-        self.add_endpoint('/api/data/stats', 'get_data_stats', self.require_auth(self.get_data_stats), methods=["GET"])
+        self.add_endpoint('/data', 'data_viewer', self.require_perm(Permission.Documents.VIEW)(self.data_viewer_page))
+        self.add_endpoint('/api/data/documents', 'list_data_documents', self.require_perm(Permission.Documents.VIEW)(self.list_data_documents), methods=["GET"])
+        self.add_endpoint('/api/data/documents/<document_hash>/content', 'get_data_document_content', self.require_perm(Permission.Documents.VIEW)(self.get_data_document_content), methods=["GET"])
+        self.add_endpoint('/api/data/documents/<document_hash>/chunks', 'get_data_document_chunks', self.require_perm(Permission.Documents.VIEW)(self.get_data_document_chunks), methods=["GET"])
+        self.add_endpoint('/api/data/documents/<document_hash>/enable', 'enable_data_document', self.require_perm(Permission.Documents.SELECT)(self.enable_data_document), methods=["POST"])
+        self.add_endpoint('/api/data/documents/<document_hash>/disable', 'disable_data_document', self.require_perm(Permission.Documents.SELECT)(self.disable_data_document), methods=["POST"])
+        self.add_endpoint('/api/data/bulk-enable', 'bulk_enable_documents', self.require_perm(Permission.Documents.SELECT)(self.bulk_enable_documents), methods=["POST"])
+        self.add_endpoint('/api/data/bulk-disable', 'bulk_disable_documents', self.require_perm(Permission.Documents.SELECT)(self.bulk_disable_documents), methods=["POST"])
+        self.add_endpoint('/api/data/stats', 'get_data_stats', self.require_perm(Permission.Documents.VIEW)(self.get_data_stats), methods=["GET"])
 
         # Data uploader endpoints
         logger.info("Adding data uploader API endpoints")
-        self.add_endpoint('/upload', 'upload_page', self.require_auth(self.upload_page))
-        self.add_endpoint('/api/upload/file', 'upload_file', self.require_auth(self.upload_file), methods=["POST"])
-        self.add_endpoint('/api/upload/url', 'upload_url', self.require_auth(self.upload_url), methods=["POST"])
-        self.add_endpoint('/api/upload/git', 'upload_git', self.require_auth(self.upload_git), methods=["POST", "DELETE"])
-        self.add_endpoint('/api/upload/git/refresh', 'refresh_git', self.require_auth(self.refresh_git), methods=["POST"])
-        self.add_endpoint('/api/upload/jira', 'upload_jira', self.require_auth(self.upload_jira), methods=["POST"])
-        self.add_endpoint('/api/upload/embed', 'trigger_embedding', self.require_auth(self.trigger_embedding), methods=["POST"])
-        self.add_endpoint('/api/upload/status', 'get_embedding_status', self.require_auth(self.get_embedding_status), methods=["GET"])
-        self.add_endpoint('/api/upload/documents', 'list_upload_documents', self.require_auth(self.list_upload_documents), methods=["GET"])
-        self.add_endpoint('/api/upload/documents/grouped', 'list_upload_documents_grouped', self.require_auth(self.list_upload_documents_grouped), methods=["GET"])
-        self.add_endpoint('/api/upload/documents/<document_hash>/retry', 'retry_document', self.require_auth(self.retry_document), methods=["POST"])
-        self.add_endpoint('/api/upload/documents/retry-all-failed', 'retry_all_failed', self.require_auth(self.retry_all_failed), methods=["POST"])
-        self.add_endpoint('/api/sources/git', 'list_git_sources', self.require_auth(self.list_git_sources), methods=["GET"])
-        self.add_endpoint('/api/sources/jira', 'list_jira_sources', self.require_auth(self.list_jira_sources), methods=["GET", "DELETE"])
-        self.add_endpoint('/api/sources/schedules', 'source_schedules', self.require_auth(self.source_schedules_dispatch), methods=["GET", "PUT"])
+        self.add_endpoint('/upload', 'upload_page', self.require_perm(Permission.Upload.PAGE)(self.upload_page))
+        self.add_endpoint('/api/upload/file', 'upload_file', self.require_perm(Permission.Upload.FILE)(self.upload_file), methods=["POST"])
+        self.add_endpoint('/api/upload/url', 'upload_url', self.require_perm(Permission.Upload.URL)(self.upload_url), methods=["POST"])
+        self.add_endpoint('/api/upload/git', 'upload_git', self.require_perm(Permission.Upload.GIT)(self.upload_git), methods=["POST", "DELETE"])
+        self.add_endpoint('/api/upload/git/refresh', 'refresh_git', self.require_perm(Permission.Upload.GIT)(self.refresh_git), methods=["POST"])
+        self.add_endpoint('/api/upload/jira', 'upload_jira', self.require_perm(Permission.Upload.JIRA)(self.upload_jira), methods=["POST"])
+        self.add_endpoint('/api/upload/embed', 'trigger_embedding', self.require_perm(Permission.Upload.EMBED)(self.trigger_embedding), methods=["POST"])
+        self.add_endpoint('/api/upload/status', 'get_embedding_status', self.require_perm(Permission.Upload.EMBED)(self.get_embedding_status), methods=["GET"])
+        self.add_endpoint('/api/upload/documents', 'list_upload_documents', self.require_perm(Permission.Documents.VIEW)(self.list_upload_documents), methods=["GET"])
+        self.add_endpoint('/api/upload/documents/grouped', 'list_upload_documents_grouped', self.require_perm(Permission.Documents.VIEW)(self.list_upload_documents_grouped), methods=["GET"])
+        self.add_endpoint('/api/upload/documents/<document_hash>/retry', 'retry_document', self.require_perm(Permission.Documents.SELECT)(self.retry_document), methods=["POST"])
+        self.add_endpoint('/api/upload/documents/retry-all-failed', 'retry_all_failed', self.require_perm(Permission.Documents.SELECT)(self.retry_all_failed), methods=["POST"])
+        self.add_endpoint('/api/sources/git', 'list_git_sources', self.require_perm(Permission.Sources.VIEW)(self.list_git_sources), methods=["GET"])
+        self.add_endpoint('/api/sources/jira', 'list_jira_sources', self.require_perm(Permission.Sources.VIEW)(self.list_jira_sources), methods=["GET", "DELETE"])
+        self.add_endpoint('/api/sources/schedules', 'source_schedules', self.require_perm(Permission.Sources.SELECT)(self.source_schedules_dispatch), methods=["GET", "PUT"])
 
         # Database viewer endpoints (admin only)
         logger.info("Adding database viewer API endpoints")
-        self.add_endpoint('/admin/database', 'database_viewer_page', self.require_auth(self.database_viewer_page))
-        self.add_endpoint('/api/admin/database/tables', 'list_database_tables', self.require_auth(self.list_database_tables), methods=["GET"])
-        self.add_endpoint('/api/admin/database/query', 'run_database_query', self.require_auth(self.run_database_query), methods=["POST"])
+        self.add_endpoint('/admin/database', 'database_viewer_page', self.require_perm(Permission.Admin.DATABASE)(self.database_viewer_page))
+        self.add_endpoint('/api/admin/database/tables', 'list_database_tables', self.require_perm(Permission.Admin.DATABASE)(self.list_database_tables), methods=["GET"])
+        self.add_endpoint('/api/admin/database/query', 'run_database_query', self.require_perm(Permission.Admin.DATABASE)(self.run_database_query), methods=["POST"])
+
+        # Service status board endpoints (registered via Blueprint)
+        logger.info("Adding service status board endpoints")
+        register_service_alerts(
+            self.app,
+            pg_config=self.pg_config,
+            auth_enabled=self.auth_enabled,
+            chat_app_config=self.chat_app_config,
+            require_auth=self.require_auth,
+        )
 
         # add unified auth endpoints
         if self.auth_enabled:
@@ -2017,9 +2295,34 @@ class FlaskAppWrapper(object):
             self.add_endpoint('/login', 'login', self.login, methods=['GET', 'POST'])
             self.add_endpoint('/logout', 'logout', self.logout)
             self.add_endpoint('/auth/user', 'get_user', self.get_user, methods=['GET'])
+            self.add_endpoint('/api/permissions', 'get_permissions', self.get_permissions, methods=['GET'])
+            self.add_endpoint('/api/permissions/check', 'check_permission', self.check_permission_endpoint, methods=['POST'])
+
             
             if self.sso_enabled:
                 self.add_endpoint('/redirect', 'sso_callback', self.sso_callback)
+
+    def _set_user_session(self, email: str, name: str, username: str, user_id: str = '', auth_method: str = 'sso', roles: list = None):
+        """Set user session with well-defined structure."""
+        session['user'] = {
+            'email': email,
+            'name': name,
+            'username': username,
+            'id': user_id
+        }
+        session['logged_in'] = True
+        session['auth_method'] = auth_method
+        session['roles'] = roles if roles is not None else []
+
+    def _get_session_user_email(self) -> str:
+        """Get user email from session. Returns empty string if not logged in."""
+        if not session.get('logged_in'):
+            return ''
+        return session['user']['email']
+
+    def _get_session_roles(self) -> list:
+        """Get user roles from session. Returns empty list if not logged in."""
+        return session.get('roles', [])
 
     def _setup_sso(self):
         """Initialize OAuth client for SSO using OpenID Connect"""
@@ -2075,36 +2378,50 @@ class FlaskAppWrapper(object):
             password = request.form.get('password')
             
             if check_credentials(username, password, self.salt, self.app.config['ACCOUNTS_FOLDER']):
-                session['user'] = {
-                    'email': username,
-                    'name': username,
-                    'username': username
-                }
-                session['logged_in'] = True
-                session['auth_method'] = 'basic'
+                self._set_user_session(
+                    email=username,
+                    name=username,
+                    username=username,
+                    auth_method='basic',
+                    roles=[]
+                )
                 logger.info(f"Basic auth login successful for user: {username}")
                 return redirect(url_for('index'))
             else:
                 flash('Invalid credentials')
         
         # Render login page with available auth methods
-        return render_template('login.html', 
+        return render_template('landing.html', 
                              sso_enabled=self.sso_enabled, 
                              basic_auth_enabled=self.basic_auth_enabled)
 
     def logout(self):
         """Unified logout endpoint for all auth methods"""
         auth_method = session.get('auth_method', 'unknown')
+        user_email = self._get_session_user_email() or 'unknown'
+        user_roles = session.get('roles', [])
+        
+        # Clear all session data including roles
         session.pop('user', None)
         session.pop('logged_in', None)
         session.pop('auth_method', None)
+        session.pop('roles', None)
         
-        logger.info(f"User logged out (method: {auth_method})")
+        # Log logout event
+        log_authentication_event(
+            user=user_email,
+            event_type='logout',
+            success=True,
+            method=auth_method,
+            details=f"Previous roles: {user_roles}"
+        )
+        
+        logger.info(f"User {user_email} logged out (method: {auth_method})")
         flash('You have been logged out successfully')
         return redirect(url_for('landing'))
 
     def sso_callback(self):
-        """Handle OAuth callback from SSO provider"""
+        """Handle OAuth callback from SSO provider with RBAC role extraction"""
         if not self.sso_enabled or not self.oauth:
             return jsonify({'error': 'SSO not enabled'}), 400
         
@@ -2118,44 +2435,94 @@ class FlaskAppWrapper(object):
                 # If userinfo is not in token, fetch it
                 user_info = self.oauth.sso.userinfo(token=token)
             
-            # Store user information in session (normalized structure)
-            session['user'] = {
-                'email': user_info.get('email', ''),
-                'name': user_info.get('name', user_info.get('preferred_username', '')),
-                'username': user_info.get('preferred_username', user_info.get('email', '')),
-                'id': user_info.get('sub', '')
-            }
-            session['logged_in'] = True
-            session['auth_method'] = 'sso'
+            user_email = user_info.get('email', user_info.get('preferred_username', 'unknown'))
             
-            logger.info(f"SSO login successful for user: {user_info.get('email')}")
+            # Extract roles from JWT token using RBAC module
+            # This handles role validation and default role assignment
+            user_roles = get_user_roles(token, user_email)
+            
+            # Upsert the SSO user into the users table so that conversation_metadata
+            # can reference user_id via the FK constraint.
+            sso_user_id = user_info.get('sub', '')
+            if sso_user_id:
+                try:
+                    user_service = UserService(pg_config=self.pg_config)
+                    user_service.get_or_create_user(
+                        user_id=sso_user_id,
+                        auth_provider='sso',
+                        display_name=user_info.get('name', user_info.get('preferred_username', '')),
+                        email=user_info.get('email', ''),
+                    )
+                except Exception as ue:
+                    logger.warning(f"Failed to upsert SSO user {sso_user_id} into users table: {ue}")
+
+            # Store user information in session (normalized structure)
+            self._set_user_session(
+                email=user_info.get('email', ''),
+                name=user_info.get('name', user_info.get('preferred_username', '')),
+                username=user_info.get('preferred_username', user_info.get('email', '')),
+                user_id=sso_user_id,
+                auth_method='sso',
+                roles=user_roles
+            )
+            
+            # Log successful authentication
+            log_authentication_event(
+                user=user_email,
+                event_type='login',
+                success=True,
+                method='sso',
+                details=f"Roles: {user_roles}"
+            )
+            
+            logger.info(f"SSO login successful for user: {user_email} with roles: {user_roles}")
             
             # Redirect to main page
             return redirect(url_for('index'))
             
         except Exception as e:
             logger.error(f"SSO callback error: {str(e)}")
+            log_authentication_event(
+                user='unknown',
+                event_type='login',
+                success=False,
+                method='sso',
+                details=str(e)
+            )
             flash(f"Authentication failed: {str(e)}")
             return redirect(url_for('login'))
 
     def get_user(self):
-        """API endpoint to get current user information"""
+        """API endpoint to get current user information including roles and permissions"""
         if session.get('logged_in'):
             user = session.get('user', {})
+            roles = session.get('roles', [])
+            
+            # Get permission context for the frontend
+            permissions = get_permission_context()
+            
             return jsonify({
                 'logged_in': True,
                 'email': user.get('email', ''),
                 'name': user.get('name', ''),
                 'auth_method': session.get('auth_method', 'unknown'),
-                'auth_enabled': self.auth_enabled
+                'auth_enabled': self.auth_enabled,
+                'roles': roles,
+                'permissions': permissions
             })
         return jsonify({
             'logged_in': False,
-            'auth_enabled': self.auth_enabled
+            'auth_enabled': self.auth_enabled,
+            'roles': [],
+            'permissions': get_permission_context()
         })
 
     def require_auth(self, f):
-        """Decorator to require authentication for routes"""
+        """Decorator to require authentication for routes.
+        
+        When SSO is enabled and anonymous access is blocked (sso.allow_anonymous: false),
+        unauthenticated users are redirected to SSO login instead of getting a 401 error.
+        """
         @wraps(f)
         def decorated_function(*args, **kwargs):
             if not self.auth_enabled:
@@ -2163,14 +2530,128 @@ class FlaskAppWrapper(object):
                 return f(*args, **kwargs)
             
             if not session.get('logged_in'):
-                # Return 401 Unauthorized response instead of redirecting
+                # Check if SSO is enabled and anonymous access is blocked
+                if self.sso_enabled:
+                    registry = get_registry()
+                    if not registry.allow_anonymous:
+                        # Log the redirect attempt
+                        log_authentication_event(
+                            user='anonymous',
+                            event_type='anonymous_redirect',
+                            success=False,
+                            method='web',
+                            details=f"path={request.path}, method={request.method}"
+                        )
+                        # Redirect to login page which will trigger SSO
+                        return redirect(url_for('login'))
+                
+                # Return 401 Unauthorized response for API requests
                 return jsonify({'error': 'Unauthorized', 'message': 'Authentication required'}), 401
+                if request.path.startswith('/api/'):
+                    return jsonify({'error': 'Unauthorized', 'message': 'Authentication required'}), 401
+                else:   
+                    return redirect(url_for('login'))
             
             return f(*args, **kwargs)
         return decorated_function
 
+    def require_perm(self, permission: str):
+        """
+        Decorator to require authentication AND a specific permission for routes.
+        
+        This combines require_auth with permission checking. Use for routes
+        that need specific RBAC permissions (e.g., document uploads, config changes).
+        
+        Args:
+            permission: The permission string required (e.g., 'upload:documents')
+            
+        Returns:
+            Decorator function
+        """
+        def decorator(f):
+            @wraps(f)
+            def decorated_function(*args, **kwargs):
+                # First check authentication
+                if not self.auth_enabled:
+                    return f(*args, **kwargs)
+                
+                if not session.get('logged_in'):
+                    if self.sso_enabled:
+                        registry = get_registry()
+                        if not registry.allow_anonymous:
+                            return redirect(url_for('login'))
+                    return jsonify({'error': 'Unauthorized', 'message': 'Authentication required'}), 401
+                
+                # Now check permission
+                roles = session.get('roles', [])
+                if not has_permission(permission, roles):
+                    user_email = session.get('user', {}).get('email', 'unknown')
+                    logger.warning(f"Permission denied: user {user_email} with roles {roles} lacks '{permission}'")
+                    from src.utils.rbac.audit import log_permission_check
+                    log_permission_check(
+                        permission=permission,
+                        granted=False,
+                        user=user_email,
+                        roles=roles,
+                        endpoint=request.path
+                    )
+                    return jsonify({
+                        'error': 'Forbidden',
+                        'message': f'Permission denied: requires {permission}',
+                        'required_permission': permission
+                    }), 403
+                
+                return f(*args, **kwargs)
+            return decorated_function
+        return decorator
+
     def health(self):
         return jsonify({"status": "OK"}), 200
+
+    def get_permissions(self):
+        """API endpoint to get current user's permissions"""
+        if not session.get('logged_in'):
+            return jsonify({
+                'logged_in': False,
+                'permissions': get_permission_context()
+            })
+        
+        permissions = get_permission_context()
+        return jsonify({
+            'logged_in': True,
+            'roles': session.get('roles', []),
+            'permissions': permissions
+        })
+    
+    def check_permission_endpoint(self):
+        """API endpoint to check if user has a specific permission"""
+        if not session.get('logged_in'):
+            return jsonify({
+                'error': 'Authentication required',
+                'has_permission': False
+            }), 401
+        
+        data = request.get_json()
+        if not data or 'permission' not in data:
+            return jsonify({
+                'error': 'Permission name required',
+                'has_permission': False
+            }), 400
+        
+        permission = data['permission']
+        roles = session.get('roles', [])
+        result = has_permission(permission, roles)
+        
+        # Get which roles would grant this permission
+        registry = get_registry()
+        roles_with_permission = registry.get_roles_with_permission(permission)
+        
+        return jsonify({
+            'permission': permission,
+            'has_permission': result,
+            'user_roles': roles,
+            'roles_with_permission': roles_with_permission
+        })
 
     def configs(self, **configs):
         for config, value in configs:
@@ -2215,7 +2696,25 @@ class FlaskAppWrapper(object):
             except Exception as exc:
                 logger.warning(f"Failed to load config {name} for description: {exc}")
             options.append({"name": name, "description": description})
-        return jsonify({'options': options}), 200
+        timeout_seconds = 600.0
+        try:
+            chat_cfg = (self.config.get("services", {}) or {}).get("chat_app", {}) or {}
+            configured_timeout = chat_cfg.get("client_timeout_seconds", 600)
+            if isinstance(configured_timeout, bool):
+                raise ValueError("boolean is not allowed")
+            parsed_timeout = float(configured_timeout)
+            if parsed_timeout > 0:
+                timeout_seconds = parsed_timeout
+            else:
+                raise ValueError("must be positive")
+        except Exception as exc:
+            logger.warning("Invalid services.chat_app.client_timeout_seconds; using default 600s: %s", exc)
+
+        return jsonify({
+            'options': options,
+            'client_timeout_seconds': timeout_seconds,
+            'client_timeout_ms': int(timeout_seconds * 1000),
+        }), 200
 
     def get_providers(self):
         """
@@ -2996,7 +3495,7 @@ class FlaskAppWrapper(object):
         """
         # compute timestamp at which message was received by server
         start_time = time.time()
-        server_received_msg_ts = datetime.now()
+        server_received_msg_ts = datetime.now(timezone.utc)
 
         # get user input and conversation_id from the request
         request_data = self._parse_chat_request()
@@ -3011,14 +3510,16 @@ class FlaskAppWrapper(object):
         if not client_id:
             return jsonify({'error': 'client_id missing'}), 400
 
+        user_id = session.get('user', {}).get('id') or None
+
         # query the chat and return the results.
         logger.debug("Calling the ChatWrapper()")
-        response, conversation_id, message_ids, timestamps, error_code = self.chat(message, conversation_id, client_id, is_refresh, server_received_msg_ts, client_sent_msg_ts, client_timeout,config_name)
+        response, conversation_id, message_ids, timestamps, error_code = self.chat(message, conversation_id, client_id, is_refresh, server_received_msg_ts, client_sent_msg_ts, client_timeout,config_name, user_id=user_id)
 
         # handle errors
         if error_code is not None:
             if error_code == 408:
-                output = jsonify({'error': 'client timeout'})
+                output = jsonify({'error': CLIENT_TIMEOUT_ERROR_MESSAGE})
             elif error_code == 403:
                 output = jsonify({'error': 'conversation not found'})
             else:
@@ -3026,11 +3527,11 @@ class FlaskAppWrapper(object):
             return output, error_code
 
         # compute timestamp at which message was returned to client
-        timestamps['server_response_msg_ts'] = datetime.now()
+        timestamps['server_response_msg_ts'] = datetime.now(timezone.utc)
 
         # store timing info for this message
         timestamps['server_received_msg_ts'] = server_received_msg_ts
-        timestamps['client_sent_msg_ts'] = datetime.fromtimestamp(client_sent_msg_ts)
+        timestamps['client_sent_msg_ts'] = datetime.fromtimestamp(client_sent_msg_ts, tz=timezone.utc)
         self.chat.insert_timing(message_ids[-1], timestamps)
 
         # otherwise return archi's response to client
@@ -3047,7 +3548,8 @@ class FlaskAppWrapper(object):
             'conversation_id': conversation_id,
             'archi_msg_id': message_ids[-1],
             'server_response_msg_ts': timestamps['server_response_msg_ts'].timestamp(),
-            'final_response_msg_ts': datetime.now().timestamp(),
+            'model_used': self.current_model_used,
+            'final_response_msg_ts': datetime.now(timezone.utc).timestamp(),
         }
 
         end_time = time.time()
@@ -3059,7 +3561,7 @@ class FlaskAppWrapper(object):
         """
         Streams agent updates and the final response as NDJSON.
         """
-        server_received_msg_ts = datetime.now()
+        server_received_msg_ts = datetime.now(timezone.utc)
         request_data = self._parse_chat_request()
 
         message = request_data["message"]
@@ -3076,6 +3578,8 @@ class FlaskAppWrapper(object):
 
         if not client_id:
             return jsonify({"error": "client_id missing"}), 400
+
+        user_id = session.get('user', {}).get('id') or None
 
         # Get API key from session if available
         session_api_key = None
@@ -3099,6 +3603,7 @@ class FlaskAppWrapper(object):
                 provider=provider,
                 model=model,
                 provider_api_key=session_api_key,
+                user_id=user_id,
             ):
                 yield json.dumps(event, default=str) + "\n"
 
@@ -3153,7 +3658,7 @@ class FlaskAppWrapper(object):
             feedback = {
                 "message_id"   : message_id,
                 "feedback"     : "like",
-                "feedback_ts"  : datetime.now(),
+                "feedback_ts"  : datetime.now(timezone.utc),
                 "feedback_msg" : None,
                 "incorrect"    : None,
                 "unhelpful"    : None,
@@ -3208,7 +3713,7 @@ class FlaskAppWrapper(object):
             feedback = {
                 "message_id"   : message_id,
                 "feedback"     : "dislike",
-                "feedback_ts"  : datetime.now(),
+                "feedback_ts"  : datetime.now(timezone.utc),
                 "feedback_msg" : feedback_msg,
                 "incorrect"    : incorrect,
                 "unhelpful"    : unhelpful,
@@ -3252,7 +3757,7 @@ class FlaskAppWrapper(object):
             feedback = {
                 "message_id"   : message_id,
                 "feedback"     : "comment",
-                "feedback_ts"  : datetime.now(),
+                "feedback_ts"  : datetime.now(timezone.utc),
                 "feedback_msg" : feedback_msg,
                 "incorrect"    : None,
                 "unhelpful"    : None,
@@ -3288,14 +3793,18 @@ class FlaskAppWrapper(object):
         """
         try:
             client_id = request.args.get('client_id')
-            if not client_id:
+            user_id = session.get('user', {}).get('id') or None
+            if not user_id and not client_id:
                 return jsonify({'error': 'client_id missing'}), 400
             limit = min(int(request.args.get('limit', 50)), 500)
 
             # create connection to database
             conn = psycopg2.connect(**self.pg_config)
             cursor = conn.cursor()
-            cursor.execute(SQL_LIST_CONVERSATIONS, (client_id, limit))
+            if user_id:
+                cursor.execute(SQL_LIST_CONVERSATIONS_BY_USER, (user_id, client_id, limit))
+            else:
+                cursor.execute(SQL_LIST_CONVERSATIONS, (client_id, limit))
             rows = cursor.fetchall()
 
             conversations = []
@@ -3333,10 +3842,11 @@ class FlaskAppWrapper(object):
             data = request.json
             conversation_id = data.get('conversation_id')
             client_id = data.get('client_id')
+            user_id = session.get('user', {}).get('id') or None
 
             if not conversation_id:
                 return jsonify({'error': 'conversation_id missing'}), 400
-            if not client_id:
+            if not user_id and not client_id:
                 return jsonify({'error': 'client_id missing'}), 400
 
             # create connection to database
@@ -3344,7 +3854,10 @@ class FlaskAppWrapper(object):
             cursor = conn.cursor()
 
             # get conversation metadata
-            cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
+            if user_id:
+                cursor.execute(SQL_GET_CONVERSATION_METADATA_BY_USER, (conversation_id, user_id, client_id))
+            else:
+                cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
             meta_row = cursor.fetchone()
 
             # if no metadata found, return error
@@ -3384,6 +3897,7 @@ class FlaskAppWrapper(object):
                     'message_id': row[2],
                     'feedback': row[3],
                     'comment_count': row[4] if len(row) > 4 else 0,
+                    'model_used': row[5] if len(row) > 5 else None,
                 }
                 
                 # Attach trace data if present
@@ -3449,10 +3963,11 @@ class FlaskAppWrapper(object):
             data = request.json
             conversation_id = data.get('conversation_id')
             client_id = data.get('client_id')
+            user_id = session.get('user', {}).get('id') or None
 
             if not conversation_id:
                 return jsonify({'error': 'conversation_id missing when deleting.'}), 400
-            if not client_id:
+            if not user_id and not client_id:
                 return jsonify({'error': 'client_id missing when deleting.'}), 400
 
             # create connection to database
@@ -3460,7 +3975,10 @@ class FlaskAppWrapper(object):
             cursor = conn.cursor()
 
             # Delete conversation metadata (SQL CASCADE will delete all child messages)
-            cursor.execute(SQL_DELETE_CONVERSATION, (conversation_id, client_id))
+            if user_id:
+                cursor.execute(SQL_DELETE_CONVERSATION_BY_USER, (conversation_id, user_id, client_id))
+            else:
+                cursor.execute(SQL_DELETE_CONVERSATION, (conversation_id, client_id))
             deleted_count = cursor.rowcount
             conn.commit()
 
@@ -3732,11 +4250,12 @@ class FlaskAppWrapper(object):
         - source_type: Optional. Filter by "local", "web", "ticket", or "all".
         - search: Optional. Search query for display_name and url.
         - enabled: Optional. Filter by "all", "enabled", or "disabled".
-        - limit: Optional. Max results (default 100).
+        - limit: Optional. Max results (default 100), or "all" for full retrieval.
         - offset: Optional. Pagination offset (default 0).
 
         Returns:
-            JSON with documents list, total, enabled_count, limit, offset
+            JSON with documents list, total, enabled_count, limit, offset,
+            has_more, next_offset
         """
         try:
             conversation_id = request.args.get('conversation_id')  # Optional now
@@ -3744,11 +4263,16 @@ class FlaskAppWrapper(object):
             source_type = request.args.get('source_type', 'all')
             search = request.args.get('search', '')
             enabled_filter = request.args.get('enabled', 'all')
-            limit = request.args.get('limit', 100, type=int)
+            limit_param = request.args.get('limit', '100')
             offset = request.args.get('offset', 0, type=int)
-
-            # Clamp limit
-            limit = max(1, min(limit, 500))
+            limit = None
+            if str(limit_param).lower() != 'all':
+                try:
+                    parsed_limit = int(limit_param)
+                except (TypeError, ValueError):
+                    return jsonify({'error': 'limit must be an integer or "all"'}), 400
+                # Clamp paged requests to keep payloads bounded
+                limit = max(1, min(parsed_limit, 500))
 
             result = self.chat.data_viewer.list_documents(
                 conversation_id=conversation_id,
@@ -4023,14 +4547,25 @@ class FlaskAppWrapper(object):
         try:
             data = request.json or {}
             url = data.get("url", "").strip()
+            depth = data.get("depth", None)
 
             if not url:
                 return jsonify({"error": "missing_url"}), 400
+            if depth is not None:
+                try:
+                    depth = int(depth)
+                except (TypeError, ValueError):
+                    return jsonify({"error": "invalid_depth"}), 400
+                if depth < 0:
+                    return jsonify({"error": "invalid_depth"}), 400
 
             # Proxy to data-manager service
+            dm_payload = {"url": url}
+            if depth is not None:
+                dm_payload["depth"] = str(depth)
             resp = requests.post(
                 f"{self.data_manager_url}/document_index/upload_url",
-                data={"url": url},
+                data=dm_payload,
                 headers=self._dm_headers,
                 timeout=300,
                 allow_redirects=False,
@@ -4054,7 +4589,7 @@ class FlaskAppWrapper(object):
                 return jsonify({
                     "success": True,
                     "url": url,
-                    "resources_scraped": 1
+                    "resources_scraped": dm_data.get("resources_scraped", 1)
                 }), 200
             else:
                 return jsonify({
@@ -4620,24 +5155,40 @@ class FlaskAppWrapper(object):
             sources = []
             seen_projects = set()
 
-            result = self.chat.data_viewer.list_documents(source_type='jira', limit=1000)
+            result = self.chat.data_viewer.list_documents(source_type='ticket', limit=1000)
+
             for doc in result.get('documents', []):
                 # Parse project key from display name or URL
                 display_name = doc.get('display_name', '')
+                url = doc.get('url', '')
                 # Jira documents often have display_name like "PROJECT-123: Title"
                 if display_name:
                     project_key = display_name.split('-')[0] if '-' in display_name else display_name
                     if project_key and project_key not in seen_projects:
                         seen_projects.add(project_key)
+                        logger.debug(f"Adding project key: {project_key}, display_name: {display_name}")
                         sources.append({
-                            'project_key': project_key,
-                            'name': project_key,
+                            'key': project_key,
+                            'name': url.split('-')[0] if '-' in url else url,
                         })
+
+            for project in sources:
+                project_key = project['key']
+                
+                ticket_count = sum(1 for doc in result.get('documents', []) if doc.get('display_name', '').startswith(project_key + '-'))
+                project['ticket_count'] = ticket_count if ticket_count else 0
+                
+                last_sync = max((doc.get('ingested_at')
+                                for doc in result.get('documents', [])
+                                if project_key in doc.get('display_name', '') and doc.get('ingested_at') is not None),
+                                default=None)
+                
+                project['last_sync'] = last_sync if last_sync else None
 
             return jsonify({"sources": sources}), 200
 
         except Exception as e:
-            logger.error(f"Error listing Jira sources: {str(e)}")
+            logger.error(f"Error listing Jira sources: {str(e)}",exc_info=True)
             return jsonify({"error": str(e)}), 500
 
     def _delete_jira_project(self):
@@ -4712,6 +5263,25 @@ class FlaskAppWrapper(object):
         """
         try:
             schedules = self.config_service.get_source_schedules()
+            jobs_by_source = {}
+
+            # Best-effort enrich with scheduler runtime metadata from data-manager.
+            try:
+                dm_response = requests.get(
+                    f"{self.data_manager_url}/api/schedules",
+                    headers=self._dm_headers,
+                    timeout=10,
+                    allow_redirects=False,
+                )
+                if dm_response.ok and not dm_response.is_redirect:
+                    jobs = (dm_response.json() or {}).get("jobs", [])
+                    jobs_by_source = {
+                        (job.get("name") or ""): job
+                        for job in jobs
+                        if isinstance(job, dict)
+                    }
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Could not fetch scheduler runtime status from data-manager: {e}")
             
             # Convert cron expressions to UI-friendly values
             schedule_display = {}
@@ -4723,9 +5293,12 @@ class FlaskAppWrapper(object):
             }
             
             for source, cron in schedules.items():
+                runtime = jobs_by_source.get(source, {})
                 schedule_display[source] = {
                     'cron': cron,
                     'display': cron_to_ui.get(cron, 'custom'),
+                    'next_run': runtime.get('next_run'),
+                    'last_run': runtime.get('last_run'),
                 }
             
             return jsonify({"schedules": schedule_display}), 200

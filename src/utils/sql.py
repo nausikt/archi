@@ -44,7 +44,8 @@ SELECT c.sender,
        c.content,
        c.message_id,
        lf.feedback,
-       COALESCE(cf.comment_count, 0) AS comment_count
+       COALESCE(cf.comment_count, 0) AS comment_count,
+       c.model_used
 FROM conversations c
 LEFT JOIN (
     SELECT DISTINCT ON (mid)
@@ -90,9 +91,9 @@ VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
 
 SQL_CREATE_CONVERSATION = """
 INSERT INTO conversation_metadata (
-    title, created_at, last_message_at, client_id, archi_version
+    title, created_at, last_message_at, client_id, archi_version, user_id
 )
-VALUES (%s, %s, %s, %s, %s)
+VALUES (%s, %s, %s, %s, %s, %s)
 RETURNING conversation_id;
 """
 
@@ -128,6 +129,34 @@ WHERE conversation_id = %s AND client_id = %s;
 SQL_DELETE_CONVERSATION = """
 DELETE FROM conversation_metadata
 WHERE conversation_id = %s AND client_id = %s;
+"""
+
+# User-ID-based variants (used when the user is authenticated)
+# Each query also falls back to client_id so that conversations created before
+# user_id was populated remain accessible.
+SQL_LIST_CONVERSATIONS_BY_USER = """
+SELECT conversation_id, title, created_at, last_message_at
+FROM conversation_metadata
+WHERE user_id = %s OR client_id = %s
+ORDER BY last_message_at DESC
+LIMIT %s;
+"""
+
+SQL_GET_CONVERSATION_METADATA_BY_USER = """
+SELECT conversation_id, title, created_at, last_message_at
+FROM conversation_metadata
+WHERE conversation_id = %s AND (user_id = %s OR client_id = %s);
+"""
+
+SQL_DELETE_CONVERSATION_BY_USER = """
+DELETE FROM conversation_metadata
+WHERE conversation_id = %s AND (user_id = %s OR client_id = %s);
+"""
+
+SQL_UPDATE_CONVERSATION_TIMESTAMP_BY_USER = """
+UPDATE conversation_metadata
+SET last_message_at = %s
+WHERE conversation_id = %s AND (user_id = %s OR client_id = %s);
 """
 
 # =============================================================================
@@ -258,4 +287,44 @@ SET status = 'cancelled',
     cancelled_by = %s,
     cancellation_reason = %s
 WHERE conversation_id = %s AND status = 'running';
+"""
+
+# =============================================================================
+# Service Alert Queries
+# =============================================================================
+
+SQL_INSERT_ALERT = """
+INSERT INTO service_alerts (severity, message, description, created_by)
+VALUES (%s, %s, %s, %s)
+RETURNING id, severity, message, description, created_by, created_at, expires_at, active;
+"""
+
+SQL_SET_ALERT_EXPIRY = """
+UPDATE service_alerts
+SET expires_at = %s
+WHERE id = %s;
+"""
+
+SQL_LIST_ALERTS = """
+SELECT id, severity, message, description, created_by, created_at, expires_at, active
+FROM service_alerts
+ORDER BY created_at DESC;
+"""
+
+SQL_LIST_ACTIVE_BANNER_ALERTS = """
+SELECT id, severity, message, description, created_by, created_at, expires_at
+FROM (
+    SELECT id, severity, message, description, created_by, created_at, expires_at
+    FROM service_alerts
+    WHERE active = TRUE AND (expires_at IS NULL OR expires_at > NOW())
+    ORDER BY created_at DESC
+    LIMIT 5
+) latest
+ORDER BY
+    CASE severity WHEN 'alarm' THEN 0 WHEN 'warning' THEN 1 WHEN 'info' THEN 2 WHEN 'news' THEN 3 ELSE 4 END,
+    created_at DESC;
+"""
+
+SQL_DELETE_ALERT = """
+DELETE FROM service_alerts WHERE id = %s;
 """

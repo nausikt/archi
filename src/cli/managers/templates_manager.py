@@ -135,6 +135,7 @@ class TemplateManager:
         stages: List[Callable[[TemplateContext], None]] = [
             self._stage_prompts,
             self._stage_agents,
+            self._stage_skills,
             self._stage_configs,
             self._stage_service_artifacts,
             self._stage_postgres_init,
@@ -156,8 +157,29 @@ class TemplateManager:
 
     def _stage_agents(self, context: TemplateContext) -> None:
         config = context.config_manager.config or {}
-        agents_dir = ((config.get("services") or {}).get("chat_app") or {}).get("agents_dir")
         dst_dir = context.base_dir / "data" / "agents"
+        services_cfg = config.get("services", {}) or {}
+
+        if context.benchmarking:
+            benchmark_cfg = services_cfg.get("benchmarking", {}) or {}
+            agent_md_file = benchmark_cfg.get("agent_md_file")
+            if not agent_md_file:
+                raise ValueError("Missing required services.benchmarking.agent_md_file in config.")
+            source_path = Path(str(agent_md_file)).expanduser()
+            config_path = Path(str(config.get("_config_path", ""))).expanduser()
+            if not source_path.is_absolute() and config_path:
+                candidate = (config_path.parent / source_path).resolve()
+                if candidate.exists():
+                    source_path = candidate
+            if not source_path.exists() or not source_path.is_file():
+                raise ValueError(f"Benchmark agent file not found: {source_path}")
+            if source_path.suffix.lower() != ".md":
+                raise ValueError(f"Benchmark agent file must be a .md file: {source_path}")
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source_path, dst_dir / source_path.name)
+            return
+
+        agents_dir = (services_cfg.get("chat_app") or {}).get("agents_dir")
         if not agents_dir:
             if dst_dir.exists() and any(p.suffix.lower() == ".md" for p in dst_dir.iterdir()):
                 return
@@ -173,6 +195,31 @@ class TemplateManager:
                 copied += 1
         if copied == 0:
             raise ValueError(f"No agent markdown files found in {src_dir}")
+
+    def _stage_skills(self, context: TemplateContext) -> None:
+        config = context.config_manager.config or {}
+        services_cfg = config.get("services", {}) or {}
+        skills_dir = (services_cfg.get("chat_app") or {}).get("skills_dir")
+        if not skills_dir:
+            logger.debug("No skills_dir configured; skipping skills copy")
+            return
+
+        src_dir = Path(skills_dir).expanduser()
+        if not src_dir.exists() or not src_dir.is_dir():
+            logger.warning("Skills directory not found: %s", src_dir)
+            return
+
+        dst_dir = context.base_dir / "data" / "skills"
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        for skill_file in sorted(src_dir.iterdir()):
+            if skill_file.is_file() and skill_file.suffix.lower() == ".md":
+                shutil.copyfile(skill_file, dst_dir / skill_file.name)
+                copied += 1
+        if copied:
+            logger.info("Copied %d skill file(s) from %s", copied, src_dir)
+        else:
+            logger.warning("No skill markdown files found in %s", src_dir)
 
     def _copy_default_prompts(self, context: TemplateContext) -> None:
         """Copy default prompt templates to deployment for PromptService."""
@@ -218,7 +265,7 @@ class TemplateManager:
         self._copy_web_input_lists(context)
 
     def _stage_source_copy(self, context: TemplateContext) -> None:
-        self._copy_source_code(context.base_dir)
+        self.copy_source_code(context.base_dir)
 
     def _stage_benchmarking(self, context: TemplateContext) -> None:
         query_file = context.pop_option("query_file")
@@ -295,6 +342,14 @@ class TemplateManager:
                 service_cfg = services_cfg.get(service_name)
                 if isinstance(service_cfg, dict):
                     service_cfg["agents_dir"] = "/root/archi/agents"
+                    if service_cfg.get("skills_dir"):
+                        service_cfg["skills_dir"] = "/root/archi/skills"
+            if context.benchmarking:
+                benchmark_cfg = services_cfg.get("benchmarking")
+                if isinstance(benchmark_cfg, dict):
+                    agent_md_file = benchmark_cfg.get("agent_md_file")
+                    if agent_md_file:
+                        benchmark_cfg["agent_md_file"] = f"/root/archi/agents/{Path(str(agent_md_file)).name}"
 
             config_template = self.env.get_template(BASE_CONFIG_TEMPLATE)
             config_rendered = config_template.render(verbosity=context.plan.verbosity, **updated_config)
@@ -605,7 +660,7 @@ class TemplateManager:
             else:
                 logger.warning(f"Configured input list {input_list} not found; skipping")
 
-    def _copy_source_code(self, base_dir: Path) -> None:
+    def copy_source_code(self, base_dir: Path) -> None:
         # Try to locate the repository root in a robust way. Prefer CWD when
         # it contains expected marker files (pyproject.toml, LICENSE, .git)
         # — this is what the template/preview code typically uses. If CWD

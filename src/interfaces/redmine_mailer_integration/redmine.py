@@ -146,7 +146,7 @@ class RedmineAIWrapper:
         # prepare other information for storage
         history = "Question: " + reformatted_history[-1][1] + "\n\n\n\nHistory:\n\n" + "\n\n".join(post[0] + ": " + post[1] for post in reversed(reformatted_history[:-1]))
         link, context = self.prepare_context_for_storage(result.source_documents)
-        ts = datetime.datetime.now()
+        ts = datetime.datetime.now(datetime.timezone.utc)
 
         self.insert_conversation(issue_id, history, answer, link, context, ts)
         

@@ -66,7 +66,7 @@ def create(name: str, config_files: list, config_dir: str, env_file: str, servic
     if len(config_files) != 1:
         raise click.ClickException("Exactly one config file is supported; please provide a single -c file.")
 
-    print("Starting ARCHI deployment process...")
+    click.echo("Starting ARCHI deployment process...")
     setup_cli_logging(verbosity=verbosity)
     logger = get_logger(__name__)
 
@@ -284,6 +284,7 @@ def restart(
 ):
     """Restart a specific service in an existing deployment while reusing its configured ports."""
     setup_cli_logging(verbosity=verbosity)
+    logger = get_logger(__name__)
 
     if not podman and not check_docker_available():
         raise click.ClickException(
@@ -389,6 +390,13 @@ def restart(
             allow_port_reuse=True,
         )
 
+    if not no_build and not (config_files or config_dir):
+        template_manager = TemplateManager(env, verbosity)
+        try:
+            template_manager.copy_source_code(deployment_dir)
+        except Exception as e:
+            logger.warning(f"Warning: could not update source code before rebuild: {e}", err=True)
+
     deployment_manager = DeploymentManager(use_podman=podman)
     deployment_manager.restart_service(
         deployment_dir=deployment_dir,
@@ -472,8 +480,7 @@ def list_deployments():
 @click.option('--force', '-f', is_flag=True, help="Force deployment creation, overwriting existing deployment")
 @click.option('--tag', '-t', type=str, default="2000", help="Image tag for built containers")
 @click.option('--verbosity', '-v', type=int, default=3, help="Logging verbosity level (0-4)")
-def evaluate(name: str, config_file: str, config_dir: str, env_file: str, host_mode: bool,
-             force: bool, verbosity: int, **other_flags):
+def evaluate(name: str, config_file: str, config_dir: str, env_file: str, force: bool, verbosity: int, **other_flags):
     """Create an ARCHI deployment with selected services and data sources."""
     if not (bool(config_file) ^ bool(config_dir)): 
         raise click.ClickException(f"Must specify only one of config files or config dir")
@@ -483,7 +490,7 @@ def evaluate(name: str, config_file: str, config_dir: str, env_file: str, host_m
     else: 
         config_files = [item for item in config_file.split(",")]
 
-    print("Starting ARCHI benchmarking process...")
+    click.echo("Starting ARCHI benchmarking process...")
     setup_cli_logging(verbosity=verbosity)
     logger = get_logger(__name__)
 
@@ -537,7 +544,7 @@ def evaluate(name: str, config_file: str, config_dir: str, env_file: str, host_m
         other_flags['benchmarking'] = True
         other_flags['query_file'] = benchmarking_configs.get('queries_path', ".")
         other_flags['benchmarking_dest'] = os.path.abspath(benchmarking_configs.get('out_dir', '.'))
-        other_flags['host_mode'] = host_mode
+        other_flags['host_mode'] = other_flags.get('host_mode', False)
 
         compose_config = ServiceBuilder.build_compose_config(
                 name=name, verbosity=verbosity, base_dir=base_dir, 

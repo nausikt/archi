@@ -50,6 +50,7 @@ The main chat interface.
 | `agents_dir` | string | — | Path to agent markdown files |
 | `default_provider` | string | `local` | Default LLM provider |
 | `default_model` | string | `llama3.2` | Default model |
+| `client_timeout_seconds` | number | `600` | Chat request/stream timeout in seconds (sent to frontend as ms) |
 | `tools` | dict | `{}` | Agent-class-specific tool settings (for example `tools.monit.url`) |
 | `trained_on` | string | — | Description shown in the chat UI |
 | `hostname` | string | `localhost` | Public hostname for the chat interface |
@@ -58,6 +59,43 @@ The main chat interface.
 | `host` | string | `0.0.0.0` | Network binding |
 | `num_responses_until_feedback` | int | `3` | Responses before prompting for feedback |
 | `auth.enabled` | bool | `false` | Enable authentication |
+| `alerts.managers` | list | `[]` | Usernames allowed to create and delete alerts |
+
+#### `services.chat_app.alerts`
+
+Controls access to the [Service Status Board & Alert Banners](services.md#service-status-board--alert-banners).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `alerts.managers` | list of strings | `[]` | Usernames granted alert manager access |
+
+Access rules (evaluated in order):
+
+1. **Auth disabled** → all users may manage alerts.
+2. **Auth enabled** → a user is an alert manager if **either**:
+    - their username is in the `alerts.managers` list, **or**
+    - their session roles grant the `alerts:manage` permission.
+3. **Auth enabled, no username match, no `alerts:manage` permission** → nobody may manage (safe default).
+
+```yaml
+# Option 1: explicit username list
+services:
+  chat_app:
+    alerts:
+      managers:
+        - alice
+        - bob
+
+# Option 2: role-based via RBAC (can be combined with Option 1)
+services:
+  chat_app:
+    auth:
+      auth_roles:
+        roles:
+          ops-team:
+            permissions:
+              - alerts:manage
+```
 
 #### Provider Configuration
 
