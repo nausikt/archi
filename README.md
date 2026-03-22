@@ -2,16 +2,16 @@
   <img src="https://raw.githubusercontent.com/archi-physics/archi/main/docs/docs/_static/archi-logo.png" width="200" />
 </p>
 
-# _archi_ - AI Augmented Research Chat Intelligence
+# Archi
 
 [![CI](https://github.com/archi-physics/archi/actions/workflows/pr-preview.yml/badge.svg)](https://github.com/archi-physics/archi/actions/workflows/pr-preview.yml)
 [![Docs](https://img.shields.io/badge/docs-online-blue)](https://archi-physics.github.io/archi/)
 
-_archi_ is a retrieval-augmented generation framework for research and education teams who need a low-barrier to entry, configurable, private, and extensible assistant. The system was first developed at MIT for the SubMIT computing project, and now powers chat, ticketing, and course-support workflows across academia and research organizations.
+Archi is a retrieval-augmented generation framework for research and education teams who need a low-barrier to entry, configurable, private, and extensible assistant. The system was first developed at MIT for the SubMIT computing project, and now powers chat, ticketing, and course-support workflows across academia and research organizations.
 
 ## Key Capabilities
 
-_archi_ provides:
+Archi provides:
 - Customizable AI pipelines that combine data retrieval and LLMs (and more tools to come!).
 - Data ingestion connectors: web links, git repositories, local files, JIRA, and more.
 - Interfaces: chat app, ticketing assistant, email bot, and more.
@@ -48,4 +48,4 @@ We welcome fixes and new integrations—see the [Developer Guide](https://archi-
 
 ## License and Support
 
-_archi_ is released under the [MIT License](LICENSE). For project inquiries, contact paus@mit.edu.
+Archi is released under the [MIT License](LICENSE). For project inquiries, contact paus@mit.edu.

@@ -265,7 +265,7 @@ class TemplateManager:
         self._copy_web_input_lists(context)
 
     def _stage_source_copy(self, context: TemplateContext) -> None:
-        self._copy_source_code(context.base_dir)
+        self.copy_source_code(context.base_dir)
 
     def _stage_benchmarking(self, context: TemplateContext) -> None:
         query_file = context.pop_option("query_file")
@@ -660,7 +660,7 @@ class TemplateManager:
             else:
                 logger.warning(f"Configured input list {input_list} not found; skipping")
 
-    def _copy_source_code(self, base_dir: Path) -> None:
+    def copy_source_code(self, base_dir: Path) -> None:
         # Try to locate the repository root in a robust way. Prefer CWD when
         # it contains expected marker files (pyproject.toml, LICENSE, .git)
         # — this is what the template/preview code typically uses. If CWD

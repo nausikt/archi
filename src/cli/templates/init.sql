@@ -405,7 +405,7 @@ CREATE INDEX IF NOT EXISTS idx_conversations_model ON conversations(model_used);
 
 -- Feedback on messages
 CREATE TABLE IF NOT EXISTS feedback (
-    mid INTEGER NOT NULL REFERENCES conversations(message_id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL REFERENCES conversations(message_id) ON DELETE CASCADE,
     feedback_ts TIMESTAMPTZ NOT NULL,
     feedback TEXT NOT NULL,           -- 'like', 'dislike', 'comment'
     feedback_msg TEXT,                -- Optional text feedback/comment
@@ -413,14 +413,14 @@ CREATE TABLE IF NOT EXISTS feedback (
     unhelpful BOOLEAN,                -- Flag: response didn't help
     inappropriate BOOLEAN,            -- Flag: response was inappropriate
     
-    PRIMARY KEY (mid, feedback_ts)
+    PRIMARY KEY (message_id, feedback_ts)
 );
 
-CREATE INDEX IF NOT EXISTS idx_feedback_mid ON feedback(mid);
+CREATE INDEX IF NOT EXISTS idx_feedback_message_id ON feedback(message_id);
 
 -- Response timing metrics
 CREATE TABLE IF NOT EXISTS timing (
-    mid INTEGER PRIMARY KEY REFERENCES conversations(message_id) ON DELETE CASCADE,
+    message_id INTEGER PRIMARY KEY REFERENCES conversations(message_id) ON DELETE CASCADE,
     client_sent_msg_ts TIMESTAMPTZ NOT NULL,
     server_received_msg_ts TIMESTAMPTZ NOT NULL,
     lock_acquisition_ts TIMESTAMPTZ NOT NULL,
@@ -490,9 +490,9 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_tool ON agent_tool_calls(tool_name);
 CREATE TABLE IF NOT EXISTS ab_comparisons (
     comparison_id SERIAL PRIMARY KEY,
     conversation_id INTEGER NOT NULL REFERENCES conversation_metadata(conversation_id) ON DELETE CASCADE,
-    user_prompt_mid INTEGER NOT NULL REFERENCES conversations(message_id) ON DELETE CASCADE,
-    response_a_mid INTEGER NOT NULL REFERENCES conversations(message_id) ON DELETE CASCADE,
-    response_b_mid INTEGER NOT NULL REFERENCES conversations(message_id) ON DELETE CASCADE,
+    user_prompt_message_id INTEGER NOT NULL REFERENCES conversations(message_id) ON DELETE CASCADE,
+    response_a_message_id INTEGER NOT NULL REFERENCES conversations(message_id) ON DELETE CASCADE,
+    response_b_message_id INTEGER NOT NULL REFERENCES conversations(message_id) ON DELETE CASCADE,
     
     -- Model/pipeline info (optional - can be derived from config_*_id if not set)
     model_a VARCHAR(200),
