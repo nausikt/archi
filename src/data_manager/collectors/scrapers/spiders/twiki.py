@@ -15,7 +15,7 @@ class TwikiSpider(LinkSpider):
     name = "twiki"
     
     _DEFAULT_START_URLS = [
-        "https://twiki.cern.ch/twiki/bin/view/CMSPublic/SWGuideCrab",  # public page
+        "https://twiki.cern.ch/twiki/bin/view/CMS/HeavyIons",  # test sso-protected twiki page
     ]
 
     _DEFAULT_DENY = [
