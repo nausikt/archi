@@ -28,7 +28,7 @@ from __future__ import annotations
 from functools import singledispatch
  
 from src.data_manager.collectors.scrapers.scraped_resource import ScrapedResource
-from src.data_manager.collectors.scrapers.items import WebPageItem
+from src.data_manager.collectors.scrapers.items import WebPageItem, DiscourseTopicPageItem
  
  
 @singledispatch
@@ -61,4 +61,23 @@ def _html_page(item) -> ScrapedResource:
         },
     )
 
+@to_scraped_resource.register(DiscourseTopicPageItem)
+def _discourse(item) -> ScrapedResource:
+    """
+    Discourse items carry topic-level metadata from the category JSON listing.
+    """
+    return ScrapedResource(
+        url=item["url"],
+        content=item["content"],
+        suffix=item.get("suffix", "rss"),
+        source_type=item["source_type"],
+        metadata={
+            "content_type": item.get("content_type"),
+            "encoding": item.get("encoding"),
+            "title": item.get("title"),
+            "tags": item.get("tags"),
+            "has_accepted_answer": item.get("has_accepted_answer"),
+            "created_at": item.get("created_at"),
+        },
+    )
 

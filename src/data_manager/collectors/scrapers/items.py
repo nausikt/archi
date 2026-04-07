@@ -60,3 +60,15 @@ class WebPageItem(BasePageItem):
     belong in parse_twiki_page(), not in a bloated base class.
     """
     pass
+
+class DiscourseTopicPageItem(BasePageItem):
+    """
+    Discourse topic item.
+    Carries topic-level metadata from the category JSON listing
+    useful for naming, filtering, and status tracking in the adapter.
+    """
+    topic_id = scrapy.Field()
+    slug = scrapy.Field()
+    has_accepted_answer = scrapy.Field()
+    created_at = scrapy.Field()
+    tags = scrapy.Field()
