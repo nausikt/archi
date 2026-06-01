@@ -30,6 +30,17 @@ mailbox_config = get_services_config().get("redmine_mailbox", {})
 redmine_instance = redmine.Redmine('Redmine_Helpdesk_Mail') # this name tells redmine class to not initialize archi() class
 
 while True:
-    mail = mailbox.Mailbox(user = user, password = password)
-    mail.process_messages(redmine_instance)
-    time.sleep(int(mailbox_config["mailbox_update_time"]))
+    try:
+        mail = mailbox.Mailbox(user=user, password=password)
+        mail.process_messages(redmine_instance)
+        time.sleep(int(mailbox_config["mailbox_update_time"]))
+
+    except ConnectionRefusedError as e:
+        logger.error(f"Connection refused: {e}")
+        logger.info("Retrying in 30 seconds...")
+        time.sleep(30)
+
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        logger.info("Retrying in 30 seconds...")
+        time.sleep(30)
