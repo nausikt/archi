@@ -244,7 +244,26 @@ class Redmine:
         """
         Adding a note to an existing issue (and move to 'feedback' status)
         """
-        self.redmine.issue.update(issue_id,status_id = self.status_dict['Feedback'],notes = note)
+        try:
+            logger.debug(f"Updating issue {issue_id}")
+            logger.debug(f"Status ID = {self.status_dict.get('Feedback', 'NOT FOUND')}")
+            logger.debug(f"Note content length = {len(note)}")
+            logger.debug(f"Note preview = {repr(note[:200])}")
+
+            self.redmine.issue.update(
+                issue_id,
+                status_id=self.status_dict['Feedback'],
+                notes=note
+            )
+            logger.info(f"Successfully updated issue {issue_id}")
+
+        except KeyError as e:
+            logger.error(f"KeyError: {e} - Check status_dict: {self.status_dict}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to update issue {issue_id}: {e}", exc_info=True)
+            raise
+
         return
 
     def reopen_issue(self, issue_id, note,attachments):
