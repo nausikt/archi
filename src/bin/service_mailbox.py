@@ -4,12 +4,15 @@ import time
 
 from src.interfaces.redmine_mailer_integration import mailbox, redmine
 from src.utils.env import read_secret
-from src.utils.logging import setup_logging
+from src.utils.logging import setup_logging, get_logger
 from src.utils.postgres_service_factory import PostgresServiceFactory
 from src.utils.config_access import get_services_config
 
 # set basicConfig for logging
 setup_logging()
+
+logger = get_logger(__name__)
+from src.utils.logging import get_logger
 
 # set openai
 os.environ['OPENAI_API_KEY'] = read_secret("OPENAI_API_KEY")

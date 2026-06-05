@@ -298,7 +298,7 @@ class Redmine:
         """
         Create a brand new issue in the redmine system
         """
-        if not subject.strip():
+        if not subject or not subject.strip():
             subject = 'EMPTY subject'
         issue = self.redmine.issue.new()
         issue.project_id = self.project.id
