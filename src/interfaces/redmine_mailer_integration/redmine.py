@@ -245,6 +245,10 @@ class Redmine:
         Adding a note to an existing issue (and move to 'feedback' status)
         """
         try:
+            # Sanitize note: remove problematic characters
+            # Remove emojis and special Unicode characters
+            note_sanitized = note.encode('ascii', 'ignore').decode('ascii')
+
             logger.debug(f"Updating issue {issue_id}")
             logger.debug(f"Status ID = {self.status_dict.get('Feedback', 'NOT FOUND')}")
             logger.debug(f"Note content length = {len(note)}")
