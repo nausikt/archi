@@ -135,9 +135,10 @@
                   </svg>
                   New agent
                 </button>
+                <button class="agent-dropdown-playbooks" type="button" role="menuitem">Playbooks…</button>
               </div>
             </div>
-            
+
           </div>
           <textarea class="input-field" placeholder="Ask archi..." rows="1" aria-label="Message input"></textarea>
           <button class="send-btn" title="Send message" aria-label="Send message">
@@ -146,6 +147,7 @@
             </svg>
           </button>
         </div>
+        <div class="playbook-menu" role="listbox" hidden></div>
       </div>
     </footer>
 
@@ -366,6 +368,39 @@
           </div>
         </div>
         <div class="agent-spec-resize-handle" aria-hidden="true"></div>
+      </div>
+    </div>
+
+    <div class="playbooks-modal" style="display:none;">
+      <div class="playbooks-backdrop"></div>
+      <div class="playbooks-panel" role="dialog" aria-modal="true" aria-labelledby="playbooks-title">
+        <div class="playbooks-header">
+          <h3 id="playbooks-title">Playbooks</h3>
+          <button class="playbooks-close" aria-label="Close playbooks panel">×</button>
+        </div>
+        <div class="playbooks-body">
+          <div class="playbooks-list"></div>
+          <div class="playbooks-actions">
+            <button class="playbooks-new" type="button">New playbook</button>
+            <button class="playbooks-export" type="button">Export</button>
+            <button class="playbooks-import" type="button">Import</button>
+            <input class="playbooks-import-file" type="file" accept=".zip,.md,.json" hidden />
+          </div>
+          <div class="playbooks-editor" hidden>
+            <input id="playbook-name" class="playbook-name-input" type="text" placeholder="kebab-case name, e.g. rucio-triage" autocomplete="off" />
+            <input id="playbook-description" class="playbook-desc-input" type="text" maxlength="1024" placeholder="what it does and when to use it" autocomplete="off" />
+            <select id="playbook-visibility" class="playbook-visibility-input" aria-label="Playbook visibility">
+              <option value="private">Private (only me)</option>
+              <option value="public">Public (everyone on this deployment can use it)</option>
+            </select>
+            <textarea id="playbook-body" class="playbook-body-input" rows="10" placeholder="the instructions (markdown; $ARGUMENTS receives /name arguments)"></textarea>
+            <div class="playbooks-status" id="playbooks-status" role="alert"></div>
+            <div class="playbooks-editor-actions">
+              <button class="playbook-cancel" type="button">Cancel</button>
+              <button class="playbook-save" type="button">Save</button>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
