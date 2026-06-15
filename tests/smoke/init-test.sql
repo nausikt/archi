@@ -382,7 +382,10 @@ CREATE TABLE IF NOT EXISTS conversations (
     context TEXT NOT NULL DEFAULT '',
     
     ts TIMESTAMP NOT NULL,
-    
+
+    -- Name of the user-invoked playbook applied to this (user) turn, if any.
+    playbook_name VARCHAR(100),
+
     conf_id INTEGER REFERENCES configs(config_id)
 );
 
@@ -575,6 +578,25 @@ GRANT SELECT ON
     migration_state
 TO grafana;
 
+
+-- ============================================================================
+-- PLAYBOOKS (user-authored playbook library) — mirrors src/cli/templates/init.sql
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS playbooks (
+    id          SERIAL PRIMARY KEY,
+    name        VARCHAR(100) NOT NULL,
+    description TEXT NOT NULL,
+    body        TEXT NOT NULL,
+    owner_id    VARCHAR(200) NOT NULL,
+    visibility  VARCHAR(10) NOT NULL DEFAULT 'private',
+    created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_playbooks_owner_name ON playbooks(owner_id, name);
+CREATE INDEX IF NOT EXISTS idx_playbooks_owner ON playbooks(owner_id);
+CREATE INDEX IF NOT EXISTS idx_playbooks_public ON playbooks(visibility) WHERE visibility = 'public';
 
 -- ============================================================================
 -- NOTES
