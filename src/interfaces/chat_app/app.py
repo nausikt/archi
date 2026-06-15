@@ -1,9 +1,12 @@
+import io
 import json
 import os
+import posixpath
 import random
 import re
 import time
 import uuid
+import zipfile
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -59,6 +62,15 @@ from src.utils.sql import (
     SQL_GET_REACTION_FEEDBACK,
     SQL_CREATE_AGENT_TRACE, SQL_UPDATE_AGENT_TRACE, SQL_GET_AGENT_TRACE,
     SQL_GET_TRACE_BY_MESSAGE, SQL_GET_ACTIVE_TRACE, SQL_CANCEL_ACTIVE_TRACES,
+)
+from src.utils.playbook_service import (
+    PlaybookService, PlaybookValidationError, PlaybookConflictError, PlaybookNotFoundError,
+    playbook_invocation_text, resolve_playbook_owner, render_playbook_md, parse_playbook_md,
+    MAX_BODY_CHARS, MAX_PLAYBOOKS_PER_OWNER,
+)
+from src.archi.pipelines.agents.tools.playbook_tools import (
+    set_playbook_owner, get_playbook_owner,
+    set_pending_playbook, get_pending_playbook, clear_pending_playbook,
 )
 from src.interfaces.chat_app.document_utils import *
 from src.interfaces.chat_app.service_alerts import (
@@ -274,6 +286,9 @@ class ChatRequestContext:
     model_used: Optional[str] = None
     provider_used: Optional[str] = None
     pipeline_used: Optional[str] = None
+    # Name of the user-invoked playbook applied to this turn (None if none). The clean
+    # `content` is stored/titled; the playbook body is injected only into `history`.
+    playbook_name: Optional[str] = None
 
 
 class ChatWrapper:
@@ -304,6 +319,10 @@ class ChatWrapper:
             **self.services_config["postgres"],
         }
         self.config_service = ConfigService(pg_config=self.pg_config)
+
+        # init.sql only runs on first volume init; upgrading an existing
+        # deployment needs the playbooks table + conversations.playbook_name created here.
+        self._ensure_playbook_schema()
 
         # initialize data manager (ingestion handled by data-manager service)
         # self.data_manager = DataManager(run_ingestion=False)
@@ -1149,6 +1168,87 @@ class ChatWrapper:
 
         return context
 
+    def _ensure_playbook_schema(self) -> None:
+        """Create the playbook schema on pre-existing databases (idempotent).
+
+        init.sql only runs when the Postgres volume is first initialized, so a
+        deployment upgrading an existing volume would otherwise miss the
+        `playbooks` table and the `conversations.playbook_name` column entirely.
+        Mirrors the schema in init.sql. Best-effort: a failure here must not
+        block chat startup.
+        """
+        try:
+            conn = psycopg2.connect(**self.pg_config)
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS playbooks (
+                            id          SERIAL PRIMARY KEY,
+                            name        VARCHAR(100) NOT NULL,
+                            description TEXT NOT NULL,
+                            body        TEXT NOT NULL,
+                            owner_id    VARCHAR(200) NOT NULL,
+                            visibility  VARCHAR(10) NOT NULL DEFAULT 'private',
+                            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )
+                        """
+                    )
+                    cursor.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_playbooks_owner_name "
+                        "ON playbooks(owner_id, name)"
+                    )
+                    cursor.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_playbooks_owner ON playbooks(owner_id)"
+                    )
+                    cursor.execute(
+                        "ALTER TABLE playbooks "
+                        "ADD COLUMN IF NOT EXISTS visibility VARCHAR(10) NOT NULL DEFAULT 'private'"
+                    )
+                    cursor.execute(
+                        # legacy value/index from before 'team' was renamed 'public'
+                        "UPDATE playbooks SET visibility = 'public' WHERE visibility = 'team'"
+                    )
+                    cursor.execute("DROP INDEX IF EXISTS idx_playbooks_team")
+                    cursor.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_playbooks_public ON playbooks(visibility) "
+                        "WHERE visibility = 'public'"
+                    )
+                    cursor.execute(
+                        "ALTER TABLE conversations "
+                        "ADD COLUMN IF NOT EXISTS playbook_name VARCHAR(100)"
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as exc:  # pragma: no cover - defensive startup guard
+            logger.warning("Could not ensure playbook schema: %s", exc)
+
+    def _last_user_playbook_name(self, conversation_id, sender) -> Optional[str]:
+        """Stored playbook_name of the conversation's most recent `sender` turn, or None.
+
+        Used on refresh: the agent history query (SQL_QUERY_CONVO) only carries
+        (sender, content), so the chip name is fetched separately here.
+        """
+        try:
+            conn = psycopg2.connect(**self.pg_config)
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT playbook_name FROM conversations "
+                        "WHERE conversation_id = %s AND sender = %s "
+                        "ORDER BY message_id DESC LIMIT 1",
+                        (conversation_id, sender),
+                    )
+                    row = cursor.fetchone()
+                    return row[0] if row else None
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning("Could not read stored playbook name for refresh: %s", exc)
+            return None
+
     def insert_conversation(self, conversation_id, user_message, archi_message, link, archi_context, context:ChatRequestContext, is_refresh=False) -> List[int]:
         """
         """
@@ -1169,16 +1269,17 @@ class ChatWrapper:
         pipeline_used = type(context.pipeline_used).__name__
         archi_context = _sanitize(archi_context)
 
-        # construct insert_tups with model_used and pipeline_used
-        # Format: (service, conversation_id, sender, content, link, context, ts, model_used, pipeline_used)
+        # construct insert_tups with model_used, pipeline_used, and playbook_name
+        # Format: (service, conversation_id, sender, content, link, context, ts, model_used, pipeline_used, playbook_name)
+        # The playbook applies to the user turn only; assistant rows store NULL.
         insert_tups = (
             [
-                (service, conversation_id, user_sender, user_content, '', '', user_msg_ts, model_provider, pipeline_used),
-                (service, conversation_id, ARCHI_SENDER, archi_content, link, archi_context, archi_msg_ts, model_provider, pipeline_used),
+                (service, conversation_id, user_sender, user_content, '', '', user_msg_ts, model_provider, pipeline_used, context.playbook_name),
+                (service, conversation_id, ARCHI_SENDER, archi_content, link, archi_context, archi_msg_ts, model_provider, pipeline_used, None),
             ]
             if not is_refresh
             else [
-                (service, conversation_id, ARCHI_SENDER, archi_content, link, archi_context, archi_msg_ts, model_provider, pipeline_used),
+                (service, conversation_id, ARCHI_SENDER, archi_content, link, archi_context, archi_msg_ts, model_provider, pipeline_used, None),
             ]
         )
 
@@ -1455,6 +1556,19 @@ class ChatWrapper:
             raise ValueError("client_id is required to process chat messages")
         sender, content = tuple(message[0])
 
+        # `content` stays the clean user text — it titles the conversation and is what
+        # we persist/display. A /name-invoked playbook turn expands only into
+        # `agent_content` (the command block + playbook body), which feeds the agent via
+        # history; the playbook name rides on the context so the stored message can show a chip.
+        pending = get_pending_playbook()
+        playbook_name = pending["name"] if pending else None
+        agent_content = (
+            playbook_invocation_text(
+                content, pending["name"], pending["body"], pending.get("foreign", False)
+            )
+            if pending else content
+        )
+
         if conversation_id is None:
             conversation_id = self.create_conversation(content, client_id, user_id)
             history = []
@@ -1467,12 +1581,43 @@ class ChatWrapper:
         if is_refresh:
             while history and history[-1][0] == ARCHI_SENDER:
                 _ = history.pop(-1)
+            # Re-apply the playbook that shaped the turn being regenerated: its name is
+            # stored on the user row but the body only ever lives in-flight, so without
+            # this the regenerated answer silently loses it.
+            if history:
+                last = history[-1]
+                body = pending["body"] if pending else None
+                foreign = pending.get("foreign", False) if pending else False
+                stored_name = (
+                    pending["name"] if pending
+                    else self._last_user_playbook_name(conversation_id, sender)
+                )
+                if body is None and stored_name:
+                    owner = get_playbook_owner()
+                    if owner:
+                        try:
+                            playbook_service = PlaybookService(pg_config=self.pg_config)
+                            playbook = playbook_service.get_playbook_by_name(
+                                owner, stored_name, include_public=True
+                            )
+                            body = playbook.body
+                            foreign = playbook.owner_id != owner
+                        except PlaybookNotFoundError:
+                            pass  # deleted since — regenerate without it
+                        except Exception as exc:
+                            logger.warning(
+                                "Could not re-apply playbook '%s' on refresh: %s", stored_name, exc
+                            )
+                if body:
+                    history[-1] = (
+                        last[0], playbook_invocation_text(last[1], stored_name, body, foreign)
+                    )
 
         if server_received_msg_ts.timestamp() - client_sent_msg_ts > client_timeout:
             return None, 408
 
         if not is_refresh:
-            history = history + [(sender, content)]
+            history = history + [(sender, agent_content)]
 
         if len(history) >= QUERY_LIMIT:
             return None, 500
@@ -1495,6 +1640,7 @@ class ChatWrapper:
                 model_used=model,
                 provider_used=provider,
                 pipeline_used=pipeline,
+                playbook_name=playbook_name,
             ),
             None,
         )
@@ -1798,7 +1944,7 @@ class ChatWrapper:
                 cursor = conn.cursor()
                 insert_tups = [
                     ("chat", context.conversation_id, context.sender, context.content,
-                     "", "", datetime.now(), None, None),
+                     "", "", datetime.now(), None, None, context.playbook_name),
                 ]
                 psycopg2.extras.execute_values(cursor, SQL_INSERT_CONVO, insert_tups)
                 row = cursor.fetchone()
@@ -1878,7 +2024,7 @@ class ChatWrapper:
             conn = psycopg2.connect(**self.pg_config)
             cursor = conn.cursor()
             insert_tups = [
-                ("chat", conversation_id, "archi", content, "", "", datetime.now(), model_used, pipeline_used),
+                ("chat", conversation_id, "archi", content, "", "", datetime.now(), model_used, pipeline_used, None),
             ]
             psycopg2.extras.execute_values(cursor, SQL_INSERT_CONVO, insert_tups)
             row = cursor.fetchone()
@@ -2610,6 +2756,16 @@ class FlaskAppWrapper(object):
         self.add_endpoint('/admin/database', 'database_viewer_page', self.require_perm(Permission.Admin.DATABASE)(self.database_viewer_page))
         self.add_endpoint('/api/admin/database/tables', 'list_database_tables', self.require_perm(Permission.Admin.DATABASE)(self.list_database_tables), methods=["GET"])
         self.add_endpoint('/api/admin/database/query', 'run_database_query', self.require_perm(Permission.Admin.DATABASE)(self.run_database_query), methods=["POST"])
+
+        # Playbook library endpoints (per-user reusable instruction packs)
+        logger.info("Adding playbook API endpoints")
+        self.add_endpoint('/api/playbooks', 'list_playbooks', self.require_auth(self.list_playbooks), methods=["GET"])
+        self.add_endpoint('/api/playbooks', 'create_playbook', self.require_auth(self.create_playbook), methods=["POST"])
+        self.add_endpoint('/api/playbooks/export', 'export_playbooks', self.require_auth(self.export_playbooks), methods=["GET"])
+        self.add_endpoint('/api/playbooks/import', 'import_playbooks', self.require_auth(self.import_playbooks), methods=["POST"])
+        self.add_endpoint('/api/playbooks/<int:playbook_id>', 'get_playbook', self.require_auth(self.get_playbook), methods=["GET"])
+        self.add_endpoint('/api/playbooks/<int:playbook_id>', 'update_playbook', self.require_auth(self.update_playbook), methods=["PUT"])
+        self.add_endpoint('/api/playbooks/<int:playbook_id>', 'delete_playbook', self.require_auth(self.delete_playbook), methods=["DELETE"])
 
         # Service status board endpoints (registered via Blueprint)
         logger.info("Adding service status board endpoints")
@@ -3979,6 +4135,372 @@ class FlaskAppWrapper(object):
             logger.error(f"Error deleting agent spec: {exc}")
             return jsonify({"error": str(exc)}), 500
 
+    # ── Playbooks (per-user reusable instruction packs) ──────────────────────────
+    def _resolve_playbook_owner(self, request_client_id):
+        """Resolve the verified owner for a playbook operation.
+
+        When auth is enabled and the user is logged in, the server-verified session
+        identity is used and any request-supplied client_id is ignored (closes IDOR).
+        In anonymous / auth-disabled deployments, falls back to the request client_id.
+        Returns (owner_id, None) on success, or (None, flask_error_response) on failure.
+        """
+        owner, err = resolve_playbook_owner(
+            self.auth_enabled, session.get("logged_in"), session.get("user"), request_client_id)
+        if err:
+            return None, (jsonify({"error": err}), 400)
+        return owner, None
+
+    def _playbook_svc(self) -> PlaybookService:
+        """PlaybookService on the process-wide pooled factory when available.
+
+        The agent path initializes PostgresServiceFactory at startup; reusing it
+        avoids a fresh TCP connection per /api/playbooks request. Falls back to
+        direct connections when no factory exists (e.g. non-agent pipelines).
+        """
+        try:
+            from src.utils.postgres_service_factory import PostgresServiceFactory
+            factory = PostgresServiceFactory.get_instance()
+            if factory is not None:
+                return factory.playbook_service
+        except Exception as exc:
+            logger.debug("Pooled PlaybookService unavailable, using direct connections: %s", exc)
+        return PlaybookService(pg_config=self.pg_config)
+
+    def _stage_playbook_for_request(self, client_id, playbook_name) -> None:
+        """Stage playbook state for a chat request via per-request ContextVars.
+
+        Sets the verified owner (tools fail closed on None) and, for a
+        /name-invoked turn, the pending (name, body, foreign) triple. The clean
+        message is what gets persisted; the expansion happens only in-flight (see
+        _prepare_chat_context), and the name rides along for the chip.
+        """
+        playbook_owner, _ = self._resolve_playbook_owner(client_id)
+        set_playbook_owner(playbook_owner)   # verified identity (auth on) or client_id (anon); None fails closed
+        clear_pending_playbook()             # start clean so no prior request's playbook leaks via the ContextVar
+        if not playbook_name or not playbook_owner:
+            return
+        try:
+            playbook = self._playbook_svc().get_playbook_by_name(
+                playbook_owner, playbook_name, include_public=True
+            )
+            set_pending_playbook(
+                playbook.name, playbook.body, foreign=playbook.owner_id != playbook_owner
+            )
+        except PlaybookNotFoundError:
+            # Deleted between menu load and send: proceed without it (no chip is shown).
+            logger.info("Requested playbook '%s' not found; sending the turn without it", playbook_name)
+        except Exception as exc:
+            logger.warning("Playbook lookup failed: %s", exc)
+
+    def list_playbooks(self):
+        """List the caller's playbooks plus public-shared ones (no bodies)."""
+        try:
+            owner_id, _err = self._resolve_playbook_owner(request.args.get("client_id"))
+            if _err:
+                return _err
+            svc = self._playbook_svc()
+            items = []
+            for s in svc.list_playbooks(owner_id):
+                item = {
+                    "id": s.id, "name": s.name, "description": s.description,
+                    "visibility": s.visibility, "is_mine": s.owner_id == owner_id,
+                }
+                # Owner identity is exposed only when auth verifies identities — in
+                # anonymous mode an owner id IS the credential and must not leak.
+                if self.auth_enabled and s.owner_id != owner_id:
+                    item["owner"] = s.owner_id
+                items.append(item)
+            return jsonify({"playbooks": items}), 200
+        except Exception as exc:
+            logger.error(f"Error listing playbooks: {exc}")
+            return jsonify({"error": "Internal server error"}), 500
+
+    def get_playbook(self, playbook_id):
+        """Fetch one playbook (including body) by id — own or public-shared."""
+        try:
+            owner_id, _err = self._resolve_playbook_owner(request.args.get("client_id"))
+            if _err:
+                return _err
+            svc = self._playbook_svc()
+            s = svc.get_playbook(owner_id, playbook_id, include_public=True)
+            payload = {
+                "id": s.id, "name": s.name,
+                "description": s.description, "body": s.body,
+                "visibility": s.visibility, "is_mine": s.owner_id == owner_id,
+            }
+            if self.auth_enabled and s.owner_id != owner_id:
+                payload["owner"] = s.owner_id
+            return jsonify(payload), 200
+        except PlaybookNotFoundError:
+            return jsonify({"error": f"Playbook {playbook_id} not found"}), 404
+        except Exception as exc:
+            logger.error(f"Error fetching playbook: {exc}")
+            return jsonify({"error": "Internal server error"}), 500
+
+    def create_playbook(self):
+        """Create a playbook owned by the caller."""
+        try:
+            data = request.get_json(silent=True)
+            if data is None:
+                return jsonify({"error": "Request body must be valid JSON"}), 400
+            owner_id, _err = self._resolve_playbook_owner(data.get("client_id"))
+            if _err:
+                return _err
+            svc = self._playbook_svc()
+            s = svc.create_playbook(
+                owner_id,
+                data.get("name", ""),
+                data.get("description", ""),
+                data.get("body", ""),
+                data.get("visibility") or "private",
+            )
+            return jsonify({"success": True, "id": s.id, "name": s.name}), 200
+        except PlaybookValidationError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except PlaybookConflictError as exc:
+            return jsonify({"error": str(exc)}), 409
+        except Exception as exc:
+            logger.error(f"Error creating playbook: {exc}")
+            return jsonify({"error": "Internal server error"}), 500
+
+    def update_playbook(self, playbook_id):
+        """Update fields of a playbook the caller owns."""
+        try:
+            data = request.get_json(silent=True)
+            if data is None:
+                return jsonify({"error": "Request body must be valid JSON"}), 400
+            owner_id, _err = self._resolve_playbook_owner(data.get("client_id"))
+            if _err:
+                return _err
+            svc = self._playbook_svc()
+            s = svc.update_playbook(
+                owner_id, playbook_id,
+                name=data.get("name"),
+                description=data.get("description"),
+                body=data.get("body"),
+                visibility=data.get("visibility"),
+            )
+            return jsonify({"success": True, "id": s.id, "name": s.name}), 200
+        except PlaybookNotFoundError:
+            return jsonify({"error": f"Playbook {playbook_id} not found"}), 404
+        except PlaybookValidationError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except PlaybookConflictError as exc:
+            return jsonify({"error": str(exc)}), 409
+        except Exception as exc:
+            logger.error(f"Error updating playbook: {exc}")
+            return jsonify({"error": "Internal server error"}), 500
+
+    def delete_playbook(self, playbook_id):
+        """Delete a playbook the caller owns."""
+        try:
+            data = request.get_json(silent=True) or {}
+            owner_id, _err = self._resolve_playbook_owner(
+                data.get("client_id") or request.args.get("client_id"))
+            if _err:
+                return _err
+            svc = self._playbook_svc()
+            svc.delete_playbook(owner_id, playbook_id)
+            return jsonify({"success": True, "deleted": playbook_id}), 200
+        except PlaybookNotFoundError:
+            return jsonify({"error": f"Playbook {playbook_id} not found"}), 404
+        except Exception as exc:
+            logger.error(f"Error deleting playbook: {exc}")
+            return jsonify({"error": "Internal server error"}), 500
+
+    def export_playbooks(self):
+        """Download the caller's OWN playbooks as a zip of `<name>/SKILL.md` folders.
+
+        The layout is the Agent Skills format that claude.ai also accepts, so exports
+        are portable beyond archi. Public playbooks owned by others are excluded — an
+        export is a backup of what the caller owns, not a copy of the deployment's
+        shared library.
+        """
+        try:
+            owner_id, _err = self._resolve_playbook_owner(request.args.get("client_id"))
+            if _err:
+                return _err
+            svc = self._playbook_svc()
+            own = [s for s in svc.list_playbooks(owner_id) if s.owner_id == owner_id]
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for s in own:
+                    zf.writestr(
+                        f"{s.name}/SKILL.md",
+                        render_playbook_md(s.name, s.description, s.body, s.visibility),
+                    )
+            filename = f"archi-playbooks-{datetime.now().strftime('%Y-%m-%d')}.zip"
+            return Response(
+                buf.getvalue(),
+                mimetype="application/zip",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
+        except Exception as exc:
+            logger.error(f"Error exporting playbooks: {exc}")
+            return jsonify({"error": "Internal server error"}), 500
+
+    # Upload cap: 100 playbooks * 16KB bodies plus zip overhead fits comfortably.
+    _MAX_PLAYBOOK_UPLOAD_BYTES = 8 * 1024 * 1024
+    # Per SKILL.md read cap: body cap plus generous frontmatter headroom.
+    _MAX_PLAYBOOK_MD_BYTES = MAX_BODY_CHARS * 4 + 8192
+
+    @classmethod
+    def _parse_playbook_upload(cls, upload):
+        """Parse an uploaded playbook file into import items.
+
+        Accepts a .zip of `<name>/SKILL.md` folders (the Agent Skills / claude.ai
+        layout) or a single SKILL.md. Returns (items, errors): per-entry parse
+        failures land in `errors` without sinking the batch. Returns (None, message)
+        when the file as a whole is unusable.
+        """
+        filename = (upload.filename or "").lower()
+        blob = upload.read(cls._MAX_PLAYBOOK_UPLOAD_BYTES + 1)
+        if len(blob) > cls._MAX_PLAYBOOK_UPLOAD_BYTES:
+            return None, f"Upload exceeds {cls._MAX_PLAYBOOK_UPLOAD_BYTES // (1024 * 1024)} MB"
+        if filename.endswith(".zip") or blob[:2] == b"PK":
+            try:
+                zf = zipfile.ZipFile(io.BytesIO(blob))
+            except zipfile.BadZipFile:
+                return None, "Not a valid zip file"
+            items, errors = [], []
+            entries = [
+                n for n in zf.namelist()
+                if posixpath.basename(n) == "SKILL.md" and not n.startswith("__MACOSX/")
+            ]
+            if not entries:
+                return None, "No SKILL.md found in the zip"
+            if len(entries) > MAX_PLAYBOOKS_PER_OWNER:
+                # reject up front: a partial scan of an oversized zip would silently
+                # ignore the tail while looking complete
+                return None, f"Too many playbooks in the zip (max {MAX_PLAYBOOKS_PER_OWNER})"
+            for entry in entries:
+                folder = posixpath.basename(posixpath.dirname(entry))
+                try:
+                    with zf.open(entry) as fh:
+                        raw = fh.read(cls._MAX_PLAYBOOK_MD_BYTES + 1)
+                    if len(raw) > cls._MAX_PLAYBOOK_MD_BYTES:
+                        errors.append({"name": folder or None, "error": "SKILL.md is too large"})
+                        continue
+                    items.append(parse_playbook_md(raw.decode("utf-8"), fallback_name=folder))
+                except UnicodeDecodeError:
+                    errors.append({"name": folder or None, "error": "SKILL.md is not UTF-8"})
+                except PlaybookValidationError as exc:
+                    errors.append({"name": folder or None, "error": str(exc)})
+            return items, errors
+        try:
+            text = blob.decode("utf-8")
+        except UnicodeDecodeError:
+            return None, "File must be a UTF-8 SKILL.md or a zip of playbook folders"
+        stem = posixpath.basename(filename)
+        stem = stem[:-3] if stem.endswith(".md") else stem
+        fallback = "" if stem in ("playbook", "") else stem
+        try:
+            return [parse_playbook_md(text, fallback_name=fallback)], []
+        except PlaybookValidationError as exc:
+            return None, str(exc)
+
+    def import_playbooks(self):
+        """Import playbooks into the caller's library.
+
+        Accepts a multipart upload (field `file`: a zip of `<name>/SKILL.md` folders
+        or a single SKILL.md — the Agent Skills format) with form fields client_id?
+        and on_conflict, or the legacy JSON body {client_id?, on_conflict, playbooks:
+        [{name, description, body, visibility?}]}. Existing names are skipped unless
+        on_conflict='overwrite', which updates them in place. Per-item validation
+        errors are reported without aborting the rest of the batch.
+
+        Imported playbooks are ALWAYS created private: a file's public flag must never
+        silently publish content deployment-wide. `public_flags_ignored` in the
+        response lets the UI tell the user to share from the editor instead.
+        """
+        try:
+            upload = request.files.get("file")
+            if upload is not None:
+                client_id = request.form.get("client_id")
+                on_conflict = request.form.get("on_conflict", "skip")
+                items, parse_errors = self._parse_playbook_upload(upload)
+                if items is None:
+                    return jsonify({"error": parse_errors}), 400
+            else:
+                data = request.get_json(silent=True)
+                if data is None:
+                    return jsonify(
+                        {"error": "Request must be a playbook file upload or valid JSON"}
+                    ), 400
+                client_id = data.get("client_id")
+                on_conflict = data.get("on_conflict", "skip")
+                items = data.get("playbooks")
+                if not isinstance(items, list):
+                    return jsonify({"error": "JSON must contain a 'playbooks' array"}), 400
+                parse_errors = []
+            owner_id, _err = self._resolve_playbook_owner(client_id)
+            if _err:
+                return _err
+            if len(items) > MAX_PLAYBOOKS_PER_OWNER:
+                return jsonify(
+                    {"error": f"Too many playbooks in one import (max {MAX_PLAYBOOKS_PER_OWNER})"}
+                ), 400
+            if on_conflict not in ("skip", "overwrite"):
+                return jsonify({"error": "on_conflict must be 'skip' or 'overwrite'"}), 400
+            svc = self._playbook_svc()
+            imported, overwritten, skipped = [], [], []
+            errors = list(parse_errors)
+            public_flags_ignored = 0
+            for raw in items:
+                if not isinstance(raw, dict):
+                    errors.append({"name": None, "error": "each playbook must be an object"})
+                    continue
+                name = raw.get("name")
+                bad = [k for k in ("name", "description", "body", "visibility")
+                       if raw.get(k) is not None and not isinstance(raw.get(k), str)]
+                if bad:
+                    # report per item instead of letting a TypeError 500 the whole
+                    # batch after some items have already been committed
+                    errors.append({
+                        "name": name if isinstance(name, str) else None,
+                        "error": f"these fields must be strings: {', '.join(bad)}",
+                    })
+                    continue
+                # "team" is the legacy name for public visibility (older exports)
+                wants_public = raw.get("visibility") in ("public", "team")
+                try:
+                    svc.create_playbook(
+                        owner_id, name or "",
+                        raw.get("description") or "", raw.get("body") or "",
+                        "private",
+                    )
+                    imported.append(name)
+                    if wants_public:
+                        public_flags_ignored += 1
+                except PlaybookConflictError:
+                    if on_conflict == "overwrite":
+                        try:
+                            existing = svc.get_playbook_by_name(owner_id, name)
+                            # visibility deliberately untouched: overwriting content
+                            # must not flip an already-shared playbook private (or back).
+                            svc.update_playbook(
+                                owner_id, existing.id,
+                                description=raw.get("description"),
+                                body=raw.get("body"),
+                            )
+                            overwritten.append(name)
+                            if wants_public and existing.visibility != "public":
+                                public_flags_ignored += 1
+                        except (PlaybookValidationError, PlaybookNotFoundError) as exc:
+                            errors.append({"name": name, "error": str(exc)})
+                    else:
+                        skipped.append(name)
+                except PlaybookValidationError as exc:
+                    errors.append({"name": name, "error": str(exc)})
+            return jsonify({
+                "imported": imported, "overwritten": overwritten,
+                "skipped": skipped, "errors": errors,
+                "public_flags_ignored": public_flags_ignored,
+            }), 200
+        except Exception as exc:
+            logger.error(f"Error importing playbooks: {exc}")
+            return jsonify({"error": "Internal server error"}), 500
+
     def get_agent_info(self):
         """
         Get high-level information about the active agent configuration.
@@ -4520,6 +5042,8 @@ class FlaskAppWrapper(object):
             "provider": payload.get("provider"),
             "model": payload.get("model"),
             "pipeline": payload.get("pipeline"),
+            # Name of a user-invoked playbook to apply to this turn (None if none).
+            "playbook_name": payload.get("playbook_name"),
         }
 
 
@@ -4556,6 +5080,10 @@ class FlaskAppWrapper(object):
             return jsonify({'error': 'client_id missing'}), 400
 
         user_id = session.get('user', {}).get('id') or None
+
+        # Stage playbook state (verified owner + pending /name invocation) on this
+        # request context before the chat pipeline reads it in _prepare_chat_context.
+        self._stage_playbook_for_request(client_id, request_data["playbook_name"])
 
         # query the chat and return the results.
         logger.debug("Calling the ChatWrapper()")
@@ -4620,6 +5148,11 @@ class FlaskAppWrapper(object):
             return jsonify({"error": "client_id missing"}), 400
 
         user_id = session.get('user', {}).get('id') or None
+
+        # Stage playbook state (verified owner + pending /name invocation) on this
+        # request context before the chat pipeline reads it in _prepare_chat_context.
+        # stream_with_context keeps these ContextVars live through generator iteration.
+        self._stage_playbook_for_request(client_id, request_data["playbook_name"])
 
         # Get API key from session if available
         session_api_key = None
@@ -4876,6 +5409,7 @@ class FlaskAppWrapper(object):
                     'feedback': row[3],
                     'comment_count': row[4] if len(row) > 4 else 0,
                     'model_used': row[5] if len(row) > 5 else None,
+                    'playbook_name': row[6] if len(row) > 6 else None,
                 }
                 
                 # Attach trace data if present
