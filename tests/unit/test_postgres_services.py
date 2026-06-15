@@ -560,6 +560,18 @@ class TestPlaybookService:
         with pytest.raises(PlaybookValidationError, match="exceeds"):
             service.create_playbook("c1", "ok-name", "desc", "x" * 16385)
 
+    def test_validate_rejects_nul_in_body(self):
+        # A NUL (0x00) cannot be stored in a Postgres TEXT column; it must be rejected as a
+        # clean ValidationError (-> HTTP 400), not reach the INSERT and surface as a 500.
+        service = PlaybookService(connection_pool=MagicMock())
+        with pytest.raises(PlaybookValidationError, match="NUL"):
+            service.create_playbook("c1", "ok-name", "desc", "body with \x00 nul")
+
+    def test_validate_accepts_multiline_body(self):
+        # Unlike the single-line description, a body is multi-line markdown — newlines/tabs
+        # are valid and must NOT be rejected (only NUL is screened).
+        PlaybookService._validate("ok-name", "one line desc", "line1\nline2\twith tab")
+
     def test_validate_rejects_oversized_description(self):
         # the Agent Skills spec limit is 1024 chars
         service = PlaybookService(connection_pool=MagicMock())
@@ -964,6 +976,21 @@ class TestResolvePlaybookOwner:
         )
         assert owner is None
         assert err == "client_id is required"
+
+    def test_anon_nul_client_id_returns_error(self):
+        """A client_id containing NUL (0x00) → rejectable error, not an unhandled 500.
+
+        owner_id is used directly as a Postgres string parameter, which cannot contain NUL;
+        rejecting it here keeps every endpoint returning a clean 400 instead of a 500.
+        """
+        owner, err = resolve_playbook_owner(
+            auth_enabled=False,
+            logged_in=False,
+            session_user=None,
+            request_client_id="client\x00id",
+        )
+        assert owner is None
+        assert "NUL" in err
 
     def test_authed_not_logged_in_no_client_id_returns_error(self):
         """Auth enabled, not logged in, no client_id supplied → rejectable error."""

@@ -125,6 +125,12 @@ class PlaybookService:
             raise PlaybookValidationError("Playbook body is required")
         if len(body) > MAX_BODY_CHARS:
             raise PlaybookValidationError(f"Playbook body exceeds {MAX_BODY_CHARS} characters")
+        # Postgres TEXT cannot store a NUL (0x00); screen it here so it surfaces as a clean
+        # 400 instead of reaching the INSERT and being swallowed into a generic 500. Only NUL
+        # is rejected (unlike the single-line description above) — newlines/tabs are valid in
+        # a multi-line markdown body.
+        if "\x00" in body:
+            raise PlaybookValidationError("Playbook body must not contain NUL (0x00) characters")
         if visibility not in VISIBILITY_VALUES:
             raise PlaybookValidationError(
                 f"Playbook visibility must be one of {', '.join(VISIBILITY_VALUES)}"
@@ -330,6 +336,11 @@ def resolve_playbook_owner(auth_enabled, logged_in, session_user, request_client
         return None, "no verified identity for the authenticated session"
     if not request_client_id:
         return None, "client_id is required"
+    # A NUL (0x00) cannot be a Postgres string parameter; reject it at this chokepoint so a
+    # malformed client_id surfaces as a clean 400 on every endpoint rather than an unhandled
+    # psycopg2 error (500) once it is used as owner_id.
+    if "\x00" in request_client_id:
+        return None, "client_id must not contain NUL (0x00) characters"
     return request_client_id, None
 
 
