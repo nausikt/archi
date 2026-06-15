@@ -5303,35 +5303,6 @@ const Chat = {
       localStorage.setItem(CONFIG.STORAGE_KEYS.TRACE_VERBOSE_MODE, mode);
     }
   },
-};
-
-window.__ARCHI_PLAYWRIGHT__ = {
-  ab: {
-    streamOverride: null,
-
-    setStreamOverride(override) {
-      this.streamOverride = typeof override === 'function' ? override : null;
-    },
-
-    clearStreamOverride() {
-      this.streamOverride = null;
-    },
-
-    patchPoolState(patch = {}) {
-      Chat.state.abPool = {
-        ...(Chat.state.abPool || {}),
-        ...patch,
-      };
-      if (typeof UI.updateABPoolUI === 'function') {
-        UI.updateABPoolUI(Chat.state.abPool || {});
-      }
-      return Chat.state.abPool;
-    },
-
-    reset() {
-      this.streamOverride = null;
-    },
-  },
 
   openPlaybooksPanel() {
     const modal = document.querySelector('.playbooks-modal');
@@ -5404,6 +5375,35 @@ window.__ARCHI_PLAYWRIGHT__ = {
     } catch (e) {
       if (status) status.textContent = e.message || 'Could not save playbook.';
     }
+  },
+};
+
+window.__ARCHI_PLAYWRIGHT__ = {
+  ab: {
+    streamOverride: null,
+
+    setStreamOverride(override) {
+      this.streamOverride = typeof override === 'function' ? override : null;
+    },
+
+    clearStreamOverride() {
+      this.streamOverride = null;
+    },
+
+    patchPoolState(patch = {}) {
+      Chat.state.abPool = {
+        ...(Chat.state.abPool || {}),
+        ...patch,
+      };
+      if (typeof UI.updateABPoolUI === 'function') {
+        UI.updateABPoolUI(Chat.state.abPool || {});
+      }
+      return Chat.state.abPool;
+    },
+
+    reset() {
+      this.streamOverride = null;
+    },
   },
 };
 
