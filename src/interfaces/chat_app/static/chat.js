@@ -5040,6 +5040,8 @@ const Chat = {
 
     } catch (e) {
       console.error('A/B comparison error:', e);
+      UI.stopTraceTimer(msgIdA);
+      UI.stopTraceTimer(msgIdB);
       UI.showABError(e.message || 'Failed to create comparison');
       this.state.isStreaming = false;
       this.syncABPendingState();
@@ -5326,6 +5328,9 @@ const Chat = {
     } finally {
       if (timeoutId) {
         clearTimeout(timeoutId);
+      }
+      if (showTrace) {
+        UI.stopTraceTimer(messageId);
       }
       this.state.abortController = null;
       this.state.activeTrace = null;
