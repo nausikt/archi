@@ -62,6 +62,7 @@ from src.utils.sql import (
     SQL_GET_REACTION_FEEDBACK,
     SQL_CREATE_AGENT_TRACE, SQL_UPDATE_AGENT_TRACE, SQL_GET_AGENT_TRACE,
     SQL_GET_TRACE_BY_MESSAGE, SQL_GET_ACTIVE_TRACE, SQL_CANCEL_ACTIVE_TRACES,
+    SQL_INSERT_PLAYBOOK_TURN, SQL_LAST_PLAYBOOK_NAME_FOR_SENDER,
 )
 from src.utils.playbook_service import (
     PlaybookService, PlaybookValidationError, PlaybookConflictError, PlaybookNotFoundError,
@@ -289,6 +290,7 @@ class ChatRequestContext:
     # Name of the user-invoked playbook applied to this turn (None if none). The clean
     # `content` is stored/titled; the playbook body is injected only into `history`.
     playbook_name: Optional[str] = None
+    playbook_id: Optional[int] = None
 
 
 class ChatWrapper:
@@ -320,8 +322,8 @@ class ChatWrapper:
         }
         self.config_service = ConfigService(pg_config=self.pg_config)
 
-        # init.sql only runs on first volume init; upgrading an existing
-        # deployment needs the playbooks table + conversations.playbook_name created here.
+        # init.sql only runs on first volume init; upgrading an existing deployment
+        # needs the playbooks table + conversation_playbook_turns side table created here.
         self._ensure_playbook_schema()
 
         # initialize data manager (ingestion handled by data-manager service)
@@ -1173,9 +1175,11 @@ class ChatWrapper:
 
         init.sql only runs when the Postgres volume is first initialized, so a
         deployment upgrading an existing volume would otherwise miss the
-        `playbooks` table and the `conversations.playbook_name` column entirely.
-        Mirrors the schema in init.sql. Best-effort: a failure here must not
-        block chat startup.
+        `playbooks` table and the `conversation_playbook_turns` side table
+        entirely. Per-turn playbook tracking lives in that side table (not a
+        column on `conversations`); a legacy `conversations.playbook_name`
+        column, if present from an earlier build, is migrated over once and then
+        left untouched. Best-effort: a failure here must not block startup.
         """
         try:
             conn = psycopg2.connect(**self.pg_config)
@@ -1216,9 +1220,28 @@ class ChatWrapper:
                         "WHERE visibility = 'public'"
                     )
                     cursor.execute(
-                        "ALTER TABLE conversations "
-                        "ADD COLUMN IF NOT EXISTS playbook_name VARCHAR(100)"
+                        """
+                        CREATE TABLE IF NOT EXISTS conversation_playbook_turns (
+                            message_id    INTEGER PRIMARY KEY REFERENCES conversations(message_id) ON DELETE CASCADE,
+                            playbook_name VARCHAR(100) NOT NULL,
+                            playbook_id   INTEGER,
+                            created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )
+                        """
                     )
+                    # One-time migration for DBs that still carry the legacy column: copy
+                    # existing chips into the side table, then leave the dead column alone.
+                    cursor.execute(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND table_name = 'conversations' "
+                        "AND column_name = 'playbook_name'"
+                    )
+                    if cursor.fetchone():
+                        cursor.execute(
+                            "INSERT INTO conversation_playbook_turns (message_id, playbook_name) "
+                            "SELECT message_id, playbook_name FROM conversations "
+                            "WHERE playbook_name IS NOT NULL ON CONFLICT (message_id) DO NOTHING"
+                        )
                 conn.commit()
             finally:
                 conn.close()
@@ -1235,12 +1258,7 @@ class ChatWrapper:
             conn = psycopg2.connect(**self.pg_config)
             try:
                 with conn.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT playbook_name FROM conversations "
-                        "WHERE conversation_id = %s AND sender = %s "
-                        "ORDER BY message_id DESC LIMIT 1",
-                        (conversation_id, sender),
-                    )
+                    cursor.execute(SQL_LAST_PLAYBOOK_NAME_FOR_SENDER, (conversation_id, sender))
                     row = cursor.fetchone()
                     return row[0] if row else None
             finally:
@@ -1248,6 +1266,22 @@ class ChatWrapper:
         except Exception as exc:
             logger.warning("Could not read stored playbook name for refresh: %s", exc)
             return None
+
+    def _insert_playbook_turn(self, message_id, playbook_name, playbook_id=None):
+        """Best-effort: record which playbook shaped a stored user turn. A missing side
+        table (failed migration) must never break the conversation insert itself."""
+        if not message_id or not playbook_name:
+            return
+        try:
+            conn = psycopg2.connect(**self.pg_config)
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(SQL_INSERT_PLAYBOOK_TURN, (message_id, playbook_name, playbook_id))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning("Could not record playbook turn for message %s: %s", message_id, exc)
 
     def insert_conversation(self, conversation_id, user_message, archi_message, link, archi_context, context:ChatRequestContext, is_refresh=False) -> List[int]:
         """
@@ -1269,17 +1303,17 @@ class ChatWrapper:
         pipeline_used = type(context.pipeline_used).__name__
         archi_context = _sanitize(archi_context)
 
-        # construct insert_tups with model_used, pipeline_used, and playbook_name
-        # Format: (service, conversation_id, sender, content, link, context, ts, model_used, pipeline_used, playbook_name)
-        # The playbook applies to the user turn only; assistant rows store NULL.
+        # construct insert_tups with model_used, pipeline_used only (9 shared columns).
+        # Format: (service, conversation_id, sender, content, link, context, ts, model_used, pipeline_used)
+        # Playbook tracking goes to the side table via _insert_playbook_turn, not here.
         insert_tups = (
             [
-                (service, conversation_id, user_sender, user_content, '', '', user_msg_ts, model_provider, pipeline_used, context.playbook_name),
-                (service, conversation_id, ARCHI_SENDER, archi_content, link, archi_context, archi_msg_ts, model_provider, pipeline_used, None),
+                (service, conversation_id, user_sender, user_content, '', '', user_msg_ts, model_provider, pipeline_used),
+                (service, conversation_id, ARCHI_SENDER, archi_content, link, archi_context, archi_msg_ts, model_provider, pipeline_used),
             ]
             if not is_refresh
             else [
-                (service, conversation_id, ARCHI_SENDER, archi_content, link, archi_context, archi_msg_ts, model_provider, pipeline_used, None),
+                (service, conversation_id, ARCHI_SENDER, archi_content, link, archi_context, archi_msg_ts, model_provider, pipeline_used),
             ]
         )
 
@@ -1293,6 +1327,9 @@ class ChatWrapper:
         # clean up database connection state
         cursor.close()
         conn.close()
+
+        if not is_refresh and context.playbook_name and message_ids:
+            self._insert_playbook_turn(message_ids[0], context.playbook_name, context.playbook_id)
 
         return message_ids
 
@@ -1562,6 +1599,7 @@ class ChatWrapper:
         # history; the playbook name rides on the context so the stored message can show a chip.
         pending = get_pending_playbook()
         playbook_name = pending["name"] if pending else None
+        playbook_id = pending["playbook_id"] if pending else None
         agent_content = (
             playbook_invocation_text(
                 content, pending["name"], pending["body"], pending.get("foreign", False)
@@ -1641,6 +1679,7 @@ class ChatWrapper:
                 provider_used=provider,
                 pipeline_used=pipeline,
                 playbook_name=playbook_name,
+                playbook_id=playbook_id,
             ),
             None,
         )
@@ -1944,7 +1983,7 @@ class ChatWrapper:
                 cursor = conn.cursor()
                 insert_tups = [
                     ("chat", context.conversation_id, context.sender, context.content,
-                     "", "", datetime.now(), None, None, context.playbook_name),
+                     "", "", datetime.now(), None, None),
                 ]
                 psycopg2.extras.execute_values(cursor, SQL_INSERT_CONVO, insert_tups)
                 row = cursor.fetchone()
@@ -1952,6 +1991,8 @@ class ChatWrapper:
                 conn.commit()
                 cursor.close()
                 conn.close()
+                if context.playbook_name and user_prompt_mid:
+                    self._insert_playbook_turn(user_prompt_mid, context.playbook_name, context.playbook_id)
             except Exception as exc:
                 logger.error("Failed to store user message: %s", exc)
 
@@ -2024,7 +2065,7 @@ class ChatWrapper:
             conn = psycopg2.connect(**self.pg_config)
             cursor = conn.cursor()
             insert_tups = [
-                ("chat", conversation_id, "archi", content, "", "", datetime.now(), model_used, pipeline_used, None),
+                ("chat", conversation_id, "archi", content, "", "", datetime.now(), model_used, pipeline_used),
             ]
             psycopg2.extras.execute_values(cursor, SQL_INSERT_CONVO, insert_tups)
             row = cursor.fetchone()
@@ -4184,7 +4225,8 @@ class FlaskAppWrapper(object):
                 playbook_owner, playbook_name, include_public=True
             )
             set_pending_playbook(
-                playbook.name, playbook.body, foreign=playbook.owner_id != playbook_owner
+                playbook.name, playbook.body, foreign=playbook.owner_id != playbook_owner,
+                playbook_id=playbook.id
             )
         except PlaybookNotFoundError:
             # Deleted between menu load and send: proceed without it (no chip is shown).
@@ -4241,7 +4283,7 @@ class FlaskAppWrapper(object):
         """Create a playbook owned by the caller."""
         try:
             data = request.get_json(silent=True)
-            if data is None:
+            if not isinstance(data, dict):
                 return jsonify({"error": "Request body must be valid JSON"}), 400
             owner_id, _err = self._resolve_playbook_owner(data.get("client_id"))
             if _err:
@@ -4267,7 +4309,7 @@ class FlaskAppWrapper(object):
         """Update fields of a playbook the caller owns."""
         try:
             data = request.get_json(silent=True)
-            if data is None:
+            if not isinstance(data, dict):
                 return jsonify({"error": "Request body must be valid JSON"}), 400
             owner_id, _err = self._resolve_playbook_owner(data.get("client_id"))
             if _err:
@@ -4294,7 +4336,9 @@ class FlaskAppWrapper(object):
     def delete_playbook(self, playbook_id):
         """Delete a playbook the caller owns."""
         try:
-            data = request.get_json(silent=True) or {}
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict):
+                data = {}
             owner_id, _err = self._resolve_playbook_owner(
                 data.get("client_id") or request.args.get("client_id"))
             if _err:
@@ -4423,7 +4467,7 @@ class FlaskAppWrapper(object):
                     return jsonify({"error": parse_errors}), 400
             else:
                 data = request.get_json(silent=True)
-                if data is None:
+                if not isinstance(data, dict):
                     return jsonify(
                         {"error": "Request must be a playbook file upload or valid JSON"}
                     ), 400

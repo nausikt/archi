@@ -7,7 +7,7 @@
 SQL_INSERT_CONVO = """
 INSERT INTO conversations (
     archi_service, conversation_id, sender, content, link, context, ts,
-    model_used, pipeline_used, playbook_name
+    model_used, pipeline_used
 )
 VALUES %s
 RETURNING message_id;
@@ -46,7 +46,7 @@ SELECT c.sender,
        lf.feedback,
        COALESCE(cf.comment_count, 0) AS comment_count,
        c.model_used,
-       c.playbook_name
+       cpt.playbook_name
 FROM conversations c
 LEFT JOIN (
     SELECT DISTINCT ON (mid)
@@ -64,6 +64,7 @@ LEFT JOIN (
     WHERE feedback = 'comment'
     GROUP BY mid
 ) cf ON cf.mid = c.message_id
+LEFT JOIN conversation_playbook_turns cpt ON cpt.message_id = c.message_id
 WHERE c.conversation_id = %s
 ORDER BY c.message_id ASC;
 """
@@ -381,4 +382,23 @@ ORDER BY
 
 SQL_DELETE_ALERT = """
 DELETE FROM service_alerts WHERE id = %s;
+"""
+
+# =============================================================================
+# Playbook Turn Side-Table Queries
+# =============================================================================
+
+SQL_INSERT_PLAYBOOK_TURN = """
+INSERT INTO conversation_playbook_turns (message_id, playbook_name, playbook_id)
+VALUES (%s, %s, %s)
+ON CONFLICT (message_id) DO NOTHING;
+"""
+
+SQL_LAST_PLAYBOOK_NAME_FOR_SENDER = """
+SELECT cpt.playbook_name
+FROM conversations c
+JOIN conversation_playbook_turns cpt ON cpt.message_id = c.message_id
+WHERE c.conversation_id = %s AND c.sender = %s
+ORDER BY c.message_id DESC
+LIMIT 1;
 """

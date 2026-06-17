@@ -106,13 +106,9 @@ class RedmineAIWrapper:
 
         insert_tups = (
             [
-                # Columns must match SQL_INSERT_CONVO:
-                # (archi_service, conversation_id, sender, content, link, context, ts,
-                #  model_used, pipeline_used, playbook_name) -- same ts for both just to
-                # have, not as interested in timing info for redmine service; playbooks
-                # are a chat-app feature, so playbook_name is always None here.
-                (service, issue_id, "User", user_message, '', '', ts, self.current_model_used, self.current_pipeline_used, None),
-                (service, issue_id, "archi", archi_message, link, archi_context, ts, self.current_model_used, self.current_pipeline_used, None),
+                # (service, issue_id, sender, content, context, ts) -- same ts for both just to have, not as interested in timing info for redmine service...
+                (service, issue_id, "User", user_message, '', '', ts, self.current_model_used, self.current_pipeline_used),
+                (service, issue_id, "archi", archi_message, link, archi_context, ts, self.current_model_used, self.current_pipeline_used),
             ]
         )
 

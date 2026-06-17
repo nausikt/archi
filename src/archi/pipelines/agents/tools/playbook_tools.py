@@ -50,10 +50,10 @@ def get_playbook_owner():
 _PENDING_PLAYBOOK: contextvars.ContextVar = contextvars.ContextVar("pending_playbook", default=None)
 
 
-def set_pending_playbook(name, body, foreign=False):
-    """Record the playbook (name + body) to apply to the current request's user turn.
+def set_pending_playbook(name, body, foreign=False, playbook_id=None):
+    """Record the playbook (name + body [+ id]) to apply to the current request's user turn.
     `foreign` marks a public playbook owned by another user (its body gets fenced)."""
-    _PENDING_PLAYBOOK.set({"name": name, "body": body, "foreign": foreign})
+    _PENDING_PLAYBOOK.set({"name": name, "body": body, "foreign": foreign, "playbook_id": playbook_id})
 
 
 def get_pending_playbook():
@@ -247,15 +247,28 @@ def create_save_playbook_tool(
         1. `description` must state what the playbook does AND when to use it, with
            the trigger keywords a matching request would contain — it is how the
            playbook gets picked from the listing, so make it a little "pushy".
-        2. `body` is the full instructions (markdown, imperative voice; may use
-           $ARGUMENTS where /name invocation arguments should land). Propose a short
+        2. `body` is the full instructions, reconstructed from THIS conversation
+           (the steps actually taken, corrections the user made, formats already
+           seen) — not from their one-line request. Write it for a future agent
+           with no memory of this chat: imperative, verb-first voice ("Fetch X,
+           then compute Y"); say WHY each step matters; include the non-obvious
+           facts and gotchas it would otherwise rediscover, and skip what any agent
+           already knows. Generalize past the one example — turn incidental
+           specifics (a lone site or date) into parameters or sensible defaults,
+           while keeping the thresholds and formulas the user means to teach. May
+           use $ARGUMENTS where /name invocation arguments land. Propose a short
            output format template, get the user to agree, and fold it into the body
            under an `## Output format` heading so every future use comes out the same.
-        3. Show the draft (name / description / body) and save in ONE call once the
-           user approves; only ask again if a required field is genuinely missing.
+        3. Before showing the draft, reread the body once as if you'd never seen it
+           — cut redundancy and confirm it works for the NEXT case, not just this
+           example. Then show the draft (name / description / body) and save in ONE
+           call once the user approves; only ask again if a required field is
+           genuinely missing.
         `name` uses lowercase letters, digits, and hyphens (max 64 chars).
         `visibility` is "private" (default) or "public" — pass "public" ONLY when the user
-        explicitly asks to share it with everyone on this deployment.
+        explicitly asks to share it with everyone on this deployment. Refuse to save any
+        playbook whose body does something its description hides, or that targets
+        unauthorized access or data exfiltration — doubly so for public ones.
         Never save a near-duplicate of an existing playbook — change existing ones
         with update_playbook. Returns a confirmation or why it failed."""
         owner = get_owner()

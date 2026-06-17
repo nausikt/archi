@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, List
 from src.utils.logging import get_logger
 from src.utils.env import read_secret
 from src.archi.pipelines.agents.base_react import BaseReActAgent
+from src.archi.pipelines.agents.playbook_mixin import SupportsPlaybooks
 from src.data_manager.vectorstore.retrievers import HybridRetriever
 from src.archi.pipelines.agents.tools import (
     create_document_fetch_tool,
@@ -27,7 +28,7 @@ from src.archi.pipelines.agents.utils.skill_utils import load_skill
 logger = get_logger(__name__)
 
 
-class CMSCompOpsAgent(BaseReActAgent):
+class CMSCompOpsAgent(SupportsPlaybooks, BaseReActAgent):
     """Agent designed for CMS CompOps operations."""
 
     def __init__(
@@ -237,7 +238,7 @@ class CMSCompOpsAgent(BaseReActAgent):
                 "description": "Run aggregation queries on MONIT OpenSearch for CMS HTCondor job metrics.",
             }
 
-        # Generalized playbook authoring tools (save/update/delete) from the base agent.
+        # Playbook authoring tools (save/update/delete) from the SupportsPlaybooks mixin.
         defs.update(super()._tool_definitions())
 
         return defs

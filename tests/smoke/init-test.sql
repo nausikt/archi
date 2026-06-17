@@ -383,9 +383,6 @@ CREATE TABLE IF NOT EXISTS conversations (
     
     ts TIMESTAMP NOT NULL,
 
-    -- Name of the user-invoked playbook applied to this (user) turn, if any.
-    playbook_name VARCHAR(100),
-
     conf_id INTEGER REFERENCES configs(config_id)
 );
 
@@ -597,6 +594,18 @@ CREATE TABLE IF NOT EXISTS playbooks (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_playbooks_owner_name ON playbooks(owner_id, name);
 CREATE INDEX IF NOT EXISTS idx_playbooks_owner ON playbooks(owner_id);
 CREATE INDEX IF NOT EXISTS idx_playbooks_public ON playbooks(visibility) WHERE visibility = 'public';
+
+-- ============================================================================
+-- CONVERSATION PLAYBOOK TURNS (per-turn playbook tracking side table)
+-- mirrors src/cli/templates/init.sql
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS conversation_playbook_turns (
+    message_id    INTEGER PRIMARY KEY REFERENCES conversations(message_id) ON DELETE CASCADE,
+    playbook_name VARCHAR(100) NOT NULL,
+    playbook_id   INTEGER,
+    created_at    TIMESTAMP NOT NULL DEFAULT NOW()
+);
 
 -- ============================================================================
 -- NOTES

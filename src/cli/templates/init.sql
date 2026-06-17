@@ -397,10 +397,6 @@ CREATE TABLE IF NOT EXISTS conversations (
     
     ts TIMESTAMPTZ NOT NULL,
 
-    -- Name of the user-invoked playbook applied to this (user) turn, if any.
-    -- The playbook body is injected only in-flight to the model; `content` stays clean.
-    playbook_name VARCHAR(100),
-
     conf_id INTEGER REFERENCES configs(config_id)
 );
 
@@ -652,6 +648,17 @@ CREATE TABLE IF NOT EXISTS playbooks (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_playbooks_owner_name ON playbooks(owner_id, name);
 CREATE INDEX IF NOT EXISTS idx_playbooks_owner ON playbooks(owner_id);
 CREATE INDEX IF NOT EXISTS idx_playbooks_public ON playbooks(visibility) WHERE visibility = 'public';
+
+-- ============================================================================
+-- 13. CONVERSATION PLAYBOOK TURNS (per-turn playbook tracking side table)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS conversation_playbook_turns (
+    message_id    INTEGER PRIMARY KEY REFERENCES conversations(message_id) ON DELETE CASCADE,
+    playbook_name VARCHAR(100) NOT NULL,
+    playbook_id   INTEGER,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 -- ============================================================================
 -- NOTES
