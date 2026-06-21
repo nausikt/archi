@@ -1070,16 +1070,17 @@ class TestResolvePlaybookOwner:
         assert owner == "sub|12345"
         assert err is None
 
-    def test_authed_logged_in_no_email_or_sub_falls_back_to_name(self):
-        """When logged in but no email/sub, use name as verified identity."""
+    def test_authed_logged_in_name_only_fails_closed(self):
+        """A display 'name' is not unique, so it is NOT a valid owner key: a session
+        carrying only a name (no email/sub/id) must fail closed, not resolve to the name."""
         owner, err = resolve_playbook_owner(
             auth_enabled=True,
             logged_in=True,
             session_user={"name": "Bob"},
             request_client_id="frontend-uuid",
         )
-        assert owner == "Bob"
-        assert err is None
+        assert owner is None    # 'name' is no longer a fallback (not unique)
+        assert err              # error returned (fail closed)
 
     def test_authed_logged_in_empty_session_user_fails_closed(self):
         """Logged in but session_user has no usable identity -> fail closed, do NOT trust client_id."""
@@ -1315,16 +1316,17 @@ class TestResolvePlaybookOwnerGaps:
         assert owner == "oidc-subject-id"
         assert err is None
 
-    def test_authed_logged_in_empty_string_fields_fall_through_to_name(self):
-        """Empty strings for email/sub/id are falsy → fall through to 'name'."""
+    def test_authed_logged_in_empty_email_sub_id_fails_closed(self):
+        """Empty strings for email/sub/id are falsy, and 'name' is no longer a fallback
+        (not unique) → the session has no usable identity and must fail closed."""
         owner, err = resolve_playbook_owner(
             auth_enabled=True,
             logged_in=True,
             session_user={"email": "", "sub": "", "id": "", "name": "FallbackName"},
             request_client_id="ignored-uuid",
         )
-        assert owner == "FallbackName"
-        assert err is None
+        assert owner is None    # 'name' not used; fail closed
+        assert err              # error returned
 
     def test_auth_disabled_logged_in_true_nul_client_id_rejected(self):
         """Auth disabled branch: NUL in client_id is rejected even when logged_in=True."""

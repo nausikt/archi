@@ -310,7 +310,7 @@ def resolve_playbook_owner(auth_enabled, logged_in, session_user, request_client
     """Resolve the owner for a playbook operation.
 
     When auth is enabled AND the user is logged in, the server-verified identity
-    (session user's email/sub/name) is the owner and any request-supplied client_id
+    (session user's email/sub/id — all unique, immutable) is the owner and any request-supplied client_id
     is ignored — this closes the IDOR. Otherwise (anonymous / auth-disabled) the
     request client_id is the owner. Returns (owner, error_message); error_message is
     a string when the request is rejectable, else None.
@@ -319,13 +319,13 @@ def resolve_playbook_owner(auth_enabled, logged_in, session_user, request_client
         su = session_user or {}
         # The session stores the OIDC subject under 'id' (see sso_callback); 'sub' is a
         # harmless extra fallback.
-        verified = su.get("email") or su.get("sub") or su.get("id") or su.get("name")
+        verified = su.get("email") or su.get("sub") or su.get("id")
         if verified:
             return verified, None
         # Fail closed: an authenticated session with no usable identity must NOT fall back
         # to a client-supplied id — that would re-open the IDOR the verified-owner path closes.
         logger.warning(
-            "Authenticated session has no usable identity (email/sub/id/name); refusing the request."
+            "Authenticated session has no usable identity (email/sub/id); refusing the request."
         )
         return None, "no verified identity for the authenticated session"
     if not request_client_id:
