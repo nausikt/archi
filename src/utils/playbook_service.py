@@ -37,11 +37,6 @@ class Playbook:
 VISIBILITY_VALUES = ("private", "public")
 
 
-def _normalize_visibility(visibility):
-    """Accept the legacy 'team' value (older exports/clients) as 'public'."""
-    return "public" if visibility == "team" else visibility
-
-
 class PlaybookError(Exception):
     """Base class for playbook service errors."""
 
@@ -139,7 +134,6 @@ class PlaybookService:
     def create_playbook(
         self, owner_id: str, name: str, description: str, body: str, visibility: str = "private"
     ) -> Playbook:
-        visibility = _normalize_visibility(visibility)
         self._validate(name, description, body, visibility)
         conn = self._get_connection()
         try:
@@ -269,7 +263,7 @@ class PlaybookService:
         new_name = name if name is not None else existing.name
         new_desc = description if description is not None else existing.description
         new_body = body if body is not None else existing.body
-        new_visibility = _normalize_visibility(visibility) if visibility is not None else existing.visibility
+        new_visibility = visibility if visibility is not None else existing.visibility
         self._validate(new_name, new_desc, new_body, new_visibility)
         conn = self._get_connection()
         try:
@@ -430,7 +424,7 @@ def parse_playbook_md(text: str, fallback_name: str = "") -> Dict[str, str]:
         "name": str(front.get("name") or fallback_name or "").strip(),
         "description": str(front.get("description") or "").strip(),
         "body": "\n".join(lines[idx:]).strip(),
-        "visibility": "public" if visibility in ("public", "team") else "private",
+        "visibility": "public" if visibility == "public" else "private",
     }
 
 

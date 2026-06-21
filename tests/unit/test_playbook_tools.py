@@ -897,15 +897,6 @@ def test_listing_budget_boundary_exact_vs_over():
     assert desc_over not in out_over
 
 
-# Gap 7: _normalize_visibility unit — "team" maps to "public", others pass through
-def test_normalize_visibility_team_becomes_public():
-    from src.utils.playbook_service import _normalize_visibility
-    assert _normalize_visibility("team") == "public"
-    assert _normalize_visibility("public") == "public"
-    assert _normalize_visibility("private") == "private"
-    assert _normalize_visibility("unknown") == "unknown"
-
-
 # Gap 8: delete tool — confirmed=False with the name missing returns prompt without deleting
 # (This differs from test_delete_playbook_requires_confirmation_first: that test proves
 # no delete occurs for an EXISTING playbook; this test proves not-found is caught FIRST,

@@ -1157,16 +1157,6 @@ class TestResolvePlaybookOwner:
         assert owner == "sub|12345"
         assert err is None
 
-    def test_legacy_team_visibility_normalizes_to_public(self):
-        # 'team' was the original name for public visibility; old exports and
-        # API clients may still send it
-        from src.utils.playbook_service import _normalize_visibility, parse_playbook_md
-        assert _normalize_visibility("team") == "public"
-        assert _normalize_visibility("public") == "public"
-        assert _normalize_visibility("private") == "private"
-        md = "---\nname: a\ndescription: d\nmetadata:\n  visibility: team\n---\nB"
-        assert parse_playbook_md(md)["visibility"] == "public"
-
     def test_auth_disabled_logged_in_uses_request_client_id(self):
         """Auth disabled always ignores session state and uses the request client_id.
 
@@ -1409,7 +1399,7 @@ class TestValidateGaps:
         PlaybookService._validate("ok", "desc", "body", "public")
 
     def test_validate_rejects_team_visibility(self):
-        """'team' is a legacy alias normalized before _validate — _validate itself rejects it."""
+        """'team' is not an accepted visibility value — _validate rejects it (no longer aliased to public)."""
         with pytest.raises(PlaybookValidationError, match="visibility"):
             PlaybookService._validate("ok", "desc", "body", "team")
 
@@ -1417,24 +1407,6 @@ class TestValidateGaps:
         """Uppercase letters are not in [a-z0-9], must be rejected."""
         with pytest.raises(PlaybookValidationError, match="lowercase"):
             PlaybookService._validate("UPPERCASE", "desc", "body")
-
-
-class TestNormalizeVisibilityGaps:
-    """Gap tests for _normalize_visibility not covered by the existing tests."""
-
-    def test_normalize_visibility_other_value_passes_through(self):
-        """An unrecognised value (not 'team') is returned unchanged — normalization only maps 'team'."""
-        from src.utils.playbook_service import _normalize_visibility
-        assert _normalize_visibility("other") == "other"
-        assert _normalize_visibility("") == ""
-        assert _normalize_visibility("PRIVATE") == "PRIVATE"
-
-    def test_normalize_visibility_all_known_values(self):
-        """Exhaustive check: private and public are returned unchanged; team maps to public."""
-        from src.utils.playbook_service import _normalize_visibility
-        assert _normalize_visibility("private") == "private"
-        assert _normalize_visibility("public") == "public"
-        assert _normalize_visibility("team") == "public"
 
 
 class TestRowToPlaybookGaps:
@@ -1568,13 +1540,6 @@ class TestParsePlaybookMdGaps:
         list_fm = "---\n- a\n- b\n---\nBODY"
         with pytest.raises(PlaybookValidationError, match="mapping"):
             parse_playbook_md(list_fm)
-
-    def test_parse_metadata_visibility_team_normalizes_to_public(self):
-        """metadata.visibility='team' (legacy) must be normalized to 'public'."""
-        from src.utils.playbook_service import parse_playbook_md
-        md = "---\nname: a\ndescription: d\nmetadata:\n  visibility: team\n---\nB"
-        parsed = parse_playbook_md(md)
-        assert parsed["visibility"] == "public"
 
     def test_parse_leading_blank_lines_before_fence_tolerated(self):
         """Leading blank lines before the opening '---' are skipped (the parser loops over them)."""

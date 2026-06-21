@@ -1211,11 +1211,6 @@ class ChatWrapper:
                         "ADD COLUMN IF NOT EXISTS visibility VARCHAR(10) NOT NULL DEFAULT 'private'"
                     )
                     cursor.execute(
-                        # legacy value/index from before 'team' was renamed 'public'
-                        "UPDATE playbooks SET visibility = 'public' WHERE visibility = 'team'"
-                    )
-                    cursor.execute("DROP INDEX IF EXISTS idx_playbooks_team")
-                    cursor.execute(
                         "CREATE INDEX IF NOT EXISTS idx_playbooks_public ON playbooks(visibility) "
                         "WHERE visibility = 'public'"
                     )
@@ -4511,8 +4506,7 @@ class FlaskAppWrapper(object):
                         "error": f"these fields must be strings: {', '.join(bad)}",
                     })
                     continue
-                # "team" is the legacy name for public visibility (older exports)
-                wants_public = raw.get("visibility") in ("public", "team")
+                wants_public = raw.get("visibility") == "public"
                 try:
                     svc.create_playbook(
                         owner_id, name or "",
