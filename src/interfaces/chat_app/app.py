@@ -1818,6 +1818,11 @@ class ChatWrapper:
             yield self._error_event(error_code)
             return
 
+        # G2 (Layer 2): the owner ContextVar is set on this request thread by
+        # _stage_playbook_for_request; capture it so each arm thread can re-establish it.
+        # A bare threading.Thread does NOT inherit ContextVars.
+        _playbook_owner = get_playbook_owner()
+
         # Build variant archis
         try:
             arm_a_variant, arm_a_agent_spec = self._resolve_runtime_ab_variant(arm_a_variant)
@@ -1871,6 +1876,7 @@ class ChatWrapper:
 
         def _stream_arm(arm_archi, arm_label):
             """Run one arm's stream in a thread, pushing events to the shared queue."""
+            set_playbook_owner(_playbook_owner)  # G2: ContextVars don't cross the thread boundary
             import time as _time
             formatter = PipelineEventFormatter(message_content_fn=self._message_content)
             t0 = _time.monotonic()
@@ -6061,6 +6067,13 @@ class FlaskAppWrapper(object):
 
         if not client_id:
             return jsonify({"error": "client_id missing"}), 400
+
+        # G2: stage playbook state (verified owner + pending /name invocation) on this
+        # request context, mirroring the normal chat endpoints (get_chat_response[_stream]),
+        # so stream_ab_comparison -> _prepare_chat_context injects the body into both arms'
+        # shared history and the existing chip-insert fires. Also sets the owner ContextVar
+        # that the arm threads re-establish below.
+        self._stage_playbook_for_request(client_id, request_data["playbook_name"])
 
         if provider and 'provider_api_keys' in session:
             session_api_key = session.get('provider_api_keys', {}).get(provider.lower())

@@ -1,3 +1,4 @@
+import threading
 from unittest.mock import MagicMock
 
 from src.utils.playbook_service import (
@@ -919,3 +920,43 @@ def test_delete_playbook_not_found_before_confirmation_gate():
     assert "No playbook named 'ghost'" in out
     assert "cannot be undone" not in out.lower()
     svc.delete_playbook.assert_not_called()
+
+
+def test_playbook_owner_propagates_into_worker_thread_when_reset():
+    """G2 Layer-2 contract: re-setting the captured owner as the first action inside a
+    worker thread makes it visible to playbook tools running in that thread (the A/B arm)."""
+    try:
+        set_playbook_owner("owner-req")
+        captured = get_playbook_owner()          # captured on the 'request' thread
+        seen = {}
+
+        def arm():
+            set_playbook_owner(captured)          # mirrors the first line of _stream_arm
+            seen["owner"] = get_playbook_owner()
+
+        t = threading.Thread(target=arm)
+        t.start()
+        t.join()
+
+        assert seen["owner"] == "owner-req"
+    finally:
+        set_playbook_owner(None)                 # never leak the owner ContextVar across tests
+
+
+def test_playbook_owner_is_lost_in_bare_worker_thread():
+    """G2 documents WHY the fix is needed: a bare threading.Thread does NOT inherit the
+    owner ContextVar (it resets to the default None) — this was the original A/B bug."""
+    try:
+        set_playbook_owner("owner-req")
+        seen = {}
+
+        def arm():
+            seen["owner"] = get_playbook_owner()  # no re-set: today's broken A/B behavior
+
+        t = threading.Thread(target=arm)
+        t.start()
+        t.join()
+
+        assert seen["owner"] is None
+    finally:
+        set_playbook_owner(None)
