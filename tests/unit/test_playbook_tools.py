@@ -688,6 +688,23 @@ def test_invocation_text_contains_command_block_wrapper():
     assert "<command-args>my args</command-args>" in result
 
 
+def test_invocation_text_appends_run_guard_after_body():
+    # The /name path must carry the anti-fabrication / no-false-promise guard adjacent to the
+    # body — the pre-injected body otherwise dominates the distant listing guard and the agent
+    # stalls ("I'll post results later") instead of refusing when a needed tool is unavailable.
+    result = playbook_invocation_text("T1_DE_KIT", "condor-held-by-site", "BODY-MARKER then steps.")
+    assert "will post results later" in result
+    # the guard is appended AFTER the body, so it is the last instruction the model reads
+    assert result.index("BODY-MARKER") < result.index("will post results later")
+    # freshness: must also tell the model not to reuse stale numbers from earlier turns
+    assert "earlier turns in this conversation" in result
+
+
+def test_invocation_text_no_run_guard_when_body_empty():
+    # Empty body short-circuits before the guard is added.
+    assert "will post results later" not in playbook_invocation_text("args", "foo", "")
+
+
 # ── playbook load tool — additional gap cases ────────────────────────────────────────────
 
 def test_playbook_tool_foreign_public_with_args_fences_and_substitutes():
