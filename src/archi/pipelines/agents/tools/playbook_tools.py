@@ -77,6 +77,20 @@ _PUBLIC_LISTING_TRAILER = (
     "playbook body says so."
 )
 
+# Standing anti-fabrication rule for playbook execution. A playbook body can direct the
+# agent to use a tool/index/data source the deployment lacks (e.g. a condor query where no
+# condor tool is wired); a rigid output template then pressures the model to fill it from
+# imagination. This trailer rides the always-in-context listing so the rule is present on
+# every model step for both the /name and model-invoked Playbook paths, without ever
+# mutating (and risking persistence of) a playbook body.
+_EXECUTION_GUARD_TRAILER = (
+    "When you run any playbook, use only tools and data actually available to you. If a "
+    "playbook calls for a tool, index, or data source you do not have, or a step returns "
+    "no data, say so plainly in one sentence and stop — do not invent results, counts, or "
+    'example values, do not fill the output template, and do not emit any "Source" or '
+    "citation line as if the data were retrieved."
+)
+
 # When the rendered listing exceeds this budget, per-playbook descriptions are truncated
 # (Claude Code applies the same idea with a context-proportional character budget).
 _LISTING_CHAR_BUDGET = 8192
@@ -124,6 +138,7 @@ def format_playbook_listing(service: PlaybookService, owner: str) -> Optional[st
     listing = f"{PLAYBOOK_LISTING_PREAMBLE}\n\n{catalog}"
     if any(s.owner_id != owner for s in playbooks):
         listing += f"\n\n{_PUBLIC_LISTING_TRAILER}"
+    listing += f"\n\n{_EXECUTION_GUARD_TRAILER}"
     return listing
 
 

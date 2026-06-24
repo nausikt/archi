@@ -161,6 +161,34 @@ def test_listing_collapses_newlines_in_legacy_descriptions():
     assert "\n- fake-playbook" not in out
 
 
+def test_listing_includes_execution_guard_for_own_playbooks():
+    # the anti-fabrication rule rides the always-in-context listing
+    svc = MagicMock()
+    svc.list_playbooks.return_value = [
+        Playbook(id=1, name="a", description="da", body="b", owner_id="c1")]
+    out = format_playbook_listing(svc, "c1")
+    assert "say so plainly in one sentence and stop" in out
+
+
+def test_listing_includes_execution_guard_for_public_only():
+    # present even when the only visible playbook is a foreign public one
+    svc = MagicMock()
+    svc.list_playbooks.return_value = [
+        Playbook(id=2, name="theirs", description="dt", body="b",
+                 owner_id="someone-else", visibility="public")]
+    out = format_playbook_listing(svc, "c1")
+    assert "say so plainly in one sentence and stop" in out
+    # the guard append must coexist with — not replace — the public trailer
+    assert "shared by other users" in out
+
+
+def test_listing_empty_has_no_execution_guard():
+    # no playbooks -> no listing at all -> nothing to guard
+    svc = MagicMock()
+    svc.list_playbooks.return_value = []
+    assert format_playbook_listing(svc, "c1") is None
+
+
 def test_listing_middleware_appends_to_system_prompt():
     svc = MagicMock()
     svc.list_playbooks.return_value = [
