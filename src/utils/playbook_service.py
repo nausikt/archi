@@ -131,6 +131,13 @@ class PlaybookService:
                 f"Playbook visibility must be one of {', '.join(VISIBILITY_VALUES)}"
             )
 
+    @classmethod
+    def validate(cls, name: str, description: str, body: str, visibility: str = "private") -> None:
+        """Public field-validation entry point: raises PlaybookValidationError on bad input,
+        returns None when the draft is valid. Lets callers (e.g. the save_playbook preview
+        gate) check a draft before showing it to the user, without a DB write."""
+        cls._validate(name, description, body, visibility)
+
     def create_playbook(
         self, owner_id: str, name: str, description: str, body: str, visibility: str = "private"
     ) -> Playbook:

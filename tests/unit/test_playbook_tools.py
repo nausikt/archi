@@ -219,6 +219,22 @@ def _run_dynamic_prompt(middleware, request):
     return request.system_prompt
 
 
+# ── PlaybookService.validate (public wrapper) ─────────────────────────────────────────
+
+def test_playbook_service_validate_passes_for_good_fields():
+    from src.utils.playbook_service import PlaybookService
+    assert PlaybookService.validate("rucio-triage", "what and when", "the body") is None
+
+
+def test_playbook_service_validate_raises_for_bad_name():
+    from src.utils.playbook_service import PlaybookService
+    try:
+        PlaybookService.validate("Bad Name", "d", "b")
+        assert False, "expected PlaybookValidationError"
+    except PlaybookValidationError:
+        pass
+
+
 # ── save_playbook ───────────────────────────────────────────────────────────────────
 
 def test_save_playbook_success():
@@ -227,7 +243,7 @@ def test_save_playbook_success():
         id=9, name="rucio-triage", description="d", body="b", owner_id="c1")
     tool = create_save_playbook_tool(svc, _owner)
     assert tool.name == "save_playbook"
-    out = tool.invoke({"name": "rucio-triage", "description": "d", "body": "b"})
+    out = tool.invoke({"name": "rucio-triage", "description": "d", "body": "b", "confirmed": True})
     assert "Saved playbook 'rucio-triage'" in out
     # visibility defaults to private unless the user explicitly asked to share
     svc.create_playbook.assert_called_once_with("c1", "rucio-triage", "d", "b", "private")
@@ -238,7 +254,8 @@ def test_save_playbook_public_visibility_forwarded():
     svc.create_playbook.return_value = Playbook(
         id=9, name="shared-run", description="d", body="b", owner_id="c1", visibility="public")
     tool = create_save_playbook_tool(svc, _owner)
-    out = tool.invoke({"name": "shared-run", "description": "d", "body": "b", "visibility": "public"})
+    out = tool.invoke({"name": "shared-run", "description": "d", "body": "b",
+                       "visibility": "public", "confirmed": True})
     assert "public to everyone on this deployment" in out
     args, _ = svc.create_playbook.call_args
     assert args == ("c1", "shared-run", "d", "b", "public")
@@ -248,7 +265,7 @@ def test_save_playbook_conflict_is_reported():
     svc = MagicMock()
     svc.create_playbook.side_effect = PlaybookConflictError("A playbook named 'x' already exists")
     tool = create_save_playbook_tool(svc, _owner)
-    out = tool.invoke({"name": "x", "description": "d", "body": "b"})
+    out = tool.invoke({"name": "x", "description": "d", "body": "b", "confirmed": True})
     assert "already exists" in out
 
 
@@ -262,8 +279,60 @@ def test_save_playbook_validation_error_is_reported():
     svc = MagicMock()
     svc.create_playbook.side_effect = PlaybookValidationError("Playbook name must use lowercase")
     tool = create_save_playbook_tool(svc, _owner)
-    out = tool.invoke({"name": "Bad Name", "description": "d", "body": "b"})
+    out = tool.invoke({"name": "Bad Name", "description": "d", "body": "b", "confirmed": True})
     assert "Could not save" in out
+
+
+def test_save_playbook_preview_does_not_save_and_shows_draft():
+    svc = MagicMock()
+    svc.get_playbook_by_name.side_effect = PlaybookNotFoundError("free")  # name is available
+    tool = create_save_playbook_tool(svc, _owner)
+    out = tool.invoke({"name": "rucio-triage", "description": "find top failing site",
+                       "body": "THE BODY STEPS"})  # confirmed defaults to False
+    assert "rucio-triage" in out and "find top failing site" in out and "THE BODY STEPS" in out
+    assert "confirmed=true" in out          # tells the agent how to commit
+    svc.create_playbook.assert_not_called()  # nothing persisted on preview
+
+
+def test_save_playbook_preview_reports_validation_error_without_asking():
+    svc = MagicMock()
+    svc.validate.side_effect = PlaybookValidationError("Playbook name must use lowercase")
+    tool = create_save_playbook_tool(svc, _owner)
+    out = tool.invoke({"name": "Bad Name", "description": "d", "body": "b"})
+    assert "Could not prepare draft" in out
+    svc.create_playbook.assert_not_called()
+    svc.get_playbook_by_name.assert_not_called()  # bailed before the dup-check
+
+
+def test_save_playbook_preview_warns_on_duplicate_name():
+    svc = MagicMock()
+    svc.get_playbook_by_name.return_value = Playbook(
+        id=3, name="rucio-triage", description="d", body="b", owner_id="c1")
+    tool = create_save_playbook_tool(svc, _owner)
+    out = tool.invoke({"name": "rucio-triage", "description": "d", "body": "b"})
+    assert "already have a playbook named 'rucio-triage'" in out
+    assert "update_playbook" in out
+    svc.create_playbook.assert_not_called()
+
+
+def test_save_playbook_description_documents_confirm_gate():
+    tool = create_save_playbook_tool(None, lambda: None)
+    desc = " ".join(tool.description.split())
+    assert "confirmed=false" in desc and "confirmed=true" in desc
+    assert "Never set confirmed=true in the same turn" in desc
+
+
+def test_save_playbook_description_warns_arguments_are_flat_string():
+    tool = create_save_playbook_tool(None, lambda: None)
+    desc = " ".join(tool.description.split())
+    assert "ONE plain text string" in desc
+    assert "do not write $ARGUMENTS.window" in desc
+
+
+def test_save_playbook_description_discourages_questionnaire():
+    tool = create_save_playbook_tool(None, lambda: None)
+    desc = " ".join(tool.description.split())
+    assert "do NOT open with a long questionnaire" in desc
 
 
 # ── agent wiring ─────────────────────────────────────────────────────────────────────

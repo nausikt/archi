@@ -254,11 +254,15 @@ def create_save_playbook_tool(
     """
 
     @tool("save_playbook")
-    def _save_playbook(name: str, description: str, body: str, visibility: str = "private") -> str:
+    def _save_playbook(name: str, description: str, body: str, visibility: str = "private",
+                       confirmed: bool = False) -> str:
         """Save a NEW playbook to the user's personal playbook library.
         ONLY call this when the user explicitly asks to save (e.g. "save this",
         "save it as <name>"); if they are just describing or teaching a procedure,
-        acknowledge what you learned and WAIT. Authoring flow, BEFORE calling:
+        acknowledge what you learned and WAIT. Draft FIRST from what already
+        happened in this conversation — do NOT open with a long questionnaire; if a
+        choice is genuinely unclear (e.g. time window, output shape), ask at most
+        2-3 targeted questions, then draft. Authoring flow, BEFORE calling:
         1. `description` must state what the playbook does AND when to use it, with
            the trigger keywords a matching request would contain — it is how the
            playbook gets picked from the listing, so make it a little "pushy".
@@ -270,15 +274,23 @@ def create_save_playbook_tool(
            facts and gotchas it would otherwise rediscover, and skip what any agent
            already knows. Generalize past the one example — turn incidental
            specifics (a lone site or date) into parameters or sensible defaults,
-           while keeping the thresholds and formulas the user means to teach. May
-           use $ARGUMENTS where /name invocation arguments land. Propose a short
+           while keeping the thresholds and formulas the user means to teach. Arguments
+           arrive as ONE plain text string wherever you write $ARGUMENTS — it is
+           literally replaced with whatever the user typed, never a structured
+           object: do not write $ARGUMENTS.window or $ARGUMENTS.top_n (there are no
+           fields). State options as defaults in plain words (e.g. "default window:
+           last 6h; override by saying so") and have the run read any overrides from
+           the $ARGUMENTS text. Propose a short
            output format template, get the user to agree, and fold it into the body
            under an `## Output format` heading so every future use comes out the same.
         3. Before showing the draft, reread the body once as if you'd never seen it
            — cut redundancy and confirm it works for the NEXT case, not just this
-           example. Then show the draft (name / description / body) and save in ONE
-           call once the user approves; only ask again if a required field is
-           genuinely missing.
+           example. Then call save_playbook with confirmed=false to PREVIEW — it
+           validates and hands back the draft for you to show. Show that draft
+           (name / description / body), end your turn, and only after the user
+           approves in a NEW message call save_playbook again with the SAME fields
+           plus confirmed=true. Never set confirmed=true in the same turn you
+           drafted it; only ask again if a required field is genuinely missing.
         `name` uses lowercase letters, digits, and hyphens (max 64 chars).
         `visibility` is "private" (default) or "public" — pass "public" ONLY when the user
         explicitly asks to share it with everyone on this deployment. Refuse to save any
@@ -289,6 +301,28 @@ def create_save_playbook_tool(
         owner = get_owner()
         if service is None or not owner:
             return "Playbooks are unavailable in this session."
+        if not confirmed:
+            # Preview gate (mirrors delete_playbook): never persist a body the user
+            # has not seen. Validate and check the name first so a broken or clashing
+            # draft is caught before the user is asked to approve it.
+            try:
+                service.validate(name, description, body, visibility)
+            except PlaybookValidationError as e:
+                return f"Could not prepare draft: {e}"
+            try:
+                service.get_playbook_by_name(owner, name)
+            except PlaybookNotFoundError:
+                pass
+            else:
+                return (f"You already have a playbook named '{name}'. To change it, call "
+                        "update_playbook; or choose a different name.")
+            return (
+                "Show the user this draft and wait for their approval before doing anything "
+                "else — end your turn now:\n\n"
+                f"Name: {name}\nDescription: {description}\nVisibility: {visibility}\n\n{body}\n\n"
+                "If they approve it as-is, call save_playbook again with the SAME fields plus "
+                "confirmed=true. If they want changes, revise and show the new draft."
+            )
         try:
             playbook = service.create_playbook(owner, name, description, body, visibility)
             shared = " — public to everyone on this deployment" if playbook.visibility == "public" else ""
