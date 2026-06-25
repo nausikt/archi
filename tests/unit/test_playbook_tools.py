@@ -104,8 +104,9 @@ def test_listing_formats_names_and_descriptions():
     out = format_playbook_listing(svc, "c1")
     assert out.startswith(PLAYBOOK_LISTING_PREAMBLE)
     assert "- a: da" in out and "- b: db" in out
-    # no public entries -> no public trailer noise
-    assert "[public]" not in out
+    # no public entries -> own catalog lines carry no [public] marker. (Assert on the entry
+    # marker, not the bare word: the standing ownership trailer references "[public]" by name.)
+    assert "- a: da [public]" not in out and "- b: db [public]" not in out
 
 
 def test_listing_empty_returns_none():
@@ -187,6 +188,33 @@ def test_listing_empty_has_no_execution_guard():
     svc = MagicMock()
     svc.list_playbooks.return_value = []
     assert format_playbook_listing(svc, "c1") is None
+
+
+def test_listing_affirms_owner_can_edit_own_playbooks():
+    # Counter to the read-only confabulation (gpt-5 told a user their OWN private playbook
+    # was shared/read-only and refused to edit it): the always-in-context listing must
+    # positively state that un-[public] playbooks are the user's own and editable via
+    # update_playbook, so the model neither refuses nor calls them read-only.
+    svc = MagicMock()
+    svc.list_playbooks.return_value = [
+        Playbook(id=1, name="a", description="da", body="b", owner_id="c1")]
+    out = format_playbook_listing(svc, "c1")
+    assert "update_playbook" in out
+    assert "read-only" in out
+
+
+def test_listing_owner_edit_affirmation_present_with_foreign_public():
+    # the affirmation must coexist with the foreign-public read-only trailer, not be
+    # crowded out by it
+    svc = MagicMock()
+    svc.list_playbooks.return_value = [
+        Playbook(id=1, name="mine", description="dm", body="b", owner_id="c1"),
+        Playbook(id=2, name="theirs", description="dt", body="b",
+                 owner_id="someone-else", visibility="public"),
+    ]
+    out = format_playbook_listing(svc, "c1")
+    assert "update_playbook" in out            # own playbooks are editable
+    assert "shared by other users" in out      # foreign public trailer still present
 
 
 def test_listing_middleware_appends_to_system_prompt():

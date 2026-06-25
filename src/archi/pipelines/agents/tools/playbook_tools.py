@@ -91,6 +91,15 @@ _EXECUTION_GUARD_TRAILER = (
     "citation line as if the data were retrieved."
 )
 
+_OWNERSHIP_EDIT_TRAILER = (
+    "The playbooks above without a [public] tag are the user's own. When the user asks to change, "
+    "improve, rename, or fix one of their own playbooks, edit it in place with update_playbook (or "
+    "delete it with delete_playbook) — do not refuse and do not save a near-duplicate copy. A "
+    "playbook being public does not make it read-only to its owner: never tell the user that one of "
+    "their own playbooks is read-only or that you cannot edit it. Only [public] playbooks (owned by "
+    "someone else) are read-only to you."
+)
+
 # When the rendered listing exceeds this budget, per-playbook descriptions are truncated
 # (Claude Code applies the same idea with a context-proportional character budget).
 _LISTING_CHAR_BUDGET = 8192
@@ -139,6 +148,7 @@ def format_playbook_listing(service: PlaybookService, owner: str) -> Optional[st
     if any(s.owner_id != owner for s in playbooks):
         listing += f"\n\n{_PUBLIC_LISTING_TRAILER}"
     listing += f"\n\n{_EXECUTION_GUARD_TRAILER}"
+    listing += f"\n\n{_OWNERSHIP_EDIT_TRAILER}"
     return listing
 
 
