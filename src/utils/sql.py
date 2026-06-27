@@ -394,10 +394,15 @@ VALUES (%s, %s, %s)
 ON CONFLICT (message_id) DO NOTHING;
 """
 
+# Refresh/regenerate re-applies the playbook of the conversation's NEWEST sender
+# turn. The LEFT JOIN is load-bearing: it returns that turn's playbook_name, or
+# NULL when the newest turn had none. An INNER JOIN would instead skip past a
+# plain newest turn to an *earlier* turn that did use a playbook, splicing an
+# unrelated playbook into the regenerated answer.
 SQL_LAST_PLAYBOOK_NAME_FOR_SENDER = """
 SELECT cpt.playbook_name
 FROM conversations c
-JOIN conversation_playbook_turns cpt ON cpt.message_id = c.message_id
+LEFT JOIN conversation_playbook_turns cpt ON cpt.message_id = c.message_id
 WHERE c.conversation_id = %s AND c.sender = %s
 ORDER BY c.message_id DESC
 LIMIT 1;
