@@ -316,17 +316,22 @@ class PlaybookService:
 def resolve_playbook_owner(auth_enabled, logged_in, session_user, request_client_id):
     """Resolve the owner for a playbook operation.
 
-    When auth is enabled AND the user is logged in, the server-verified identity
-    (session user's email/sub/id — all unique, immutable) is the owner and any request-supplied client_id
-    is ignored — this closes the IDOR. Otherwise (anonymous / auth-disabled) the
+    When auth is enabled AND the user is logged in, the server-verified identity is the
+    owner and any request-supplied client_id is ignored — this closes the IDOR. The owner is
+    the OIDC subject (session 'id') — the SAME key persisted as users.id and
+    conversation_metadata.user_id, so a user's playbooks and conversations share one identity.
+    'sub'/email are fallbacks only (email is mutable and would diverge from those FK-linked tables).
+    Otherwise (anonymous / auth-disabled) the
     request client_id is the owner. Returns (owner, error_message); error_message is
     a string when the request is rejectable, else None.
     """
     if auth_enabled and logged_in:
         su = session_user or {}
-        # The session stores the OIDC subject under 'id' (see sso_callback); 'sub' is a
-        # harmless extra fallback.
-        verified = su.get("email") or su.get("sub") or su.get("id")
+        # Prefer the OIDC subject (stored under 'id' by sso_callback): it is exactly what
+        # users.id and conversation_metadata.user_id hold, keeping playbook ownership consistent
+        # with the rest of the identity model. email is mutable (an email change would orphan a
+        # user's playbooks), so it is only a last-resort fallback; 'sub' is a harmless alias.
+        verified = su.get("id") or su.get("sub") or su.get("email")
         if verified:
             return verified, None
         # Fail closed: an authenticated session with no usable identity must NOT fall back

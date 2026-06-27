@@ -48,7 +48,7 @@ from src.archi.utils.output_dataclass import PipelineOutput
 # from src.data_manager.data_manager import DataManager
 from src.data_manager.data_viewer_service import DataViewerService
 from src.data_manager.vectorstore.manager import VectorStoreManager
-from src.utils.env import read_secret
+from src.utils.env import read_secret, read_or_create_persistent_secret
 from src.utils.logging import get_logger
 from src.utils.config_access import get_full_config, get_services_config, get_global_config, get_dynamic_config
 from src.utils.config_service import ConfigService, StaticConfig
@@ -2622,12 +2622,12 @@ class FlaskAppWrapper(object):
         self.chat_app_config = self.config["services"]["chat_app"]
         self.data_path = self.global_config["DATA_PATH"]
         self.salt = read_secret("UPLOADER_SALT")
-        secret_key = read_secret("FLASK_UPLOADER_APP_SECRET_KEY")
-        if not secret_key:
-            logger.warning("FLASK_UPLOADER_APP_SECRET_KEY not found, generating a random secret key")
-            import secrets
-            secret_key = secrets.token_hex(32)
-        self.app.secret_key = secret_key
+        # Persist an auto-generated key in the DATA_PATH volume when none is configured, so signed
+        # sessions survive a restart — a fresh random key per boot would log every user out on each
+        # restart (an explicit FLASK_UPLOADER_APP_SECRET_KEY, if set, still takes precedence).
+        self.app.secret_key = read_or_create_persistent_secret(
+            "FLASK_UPLOADER_APP_SECRET_KEY", self.data_path
+        )
         
         # Session cookie security settings (BYOK security hardening)
         self.app.config['SESSION_COOKIE_HTTPONLY'] = True  # Prevent JavaScript access
@@ -2983,6 +2983,9 @@ class FlaskAppWrapper(object):
                         display_name=user_info.get('name', user_info.get('preferred_username', '')),
                         email=user_info.get('email', ''),
                     )
+                    # Track the login (login_count / last_login_at) — best-effort; the enclosing
+                    # try means a tracking failure can never block the login itself.
+                    user_service.record_login(sso_user_id)
                 except Exception as ue:
                     logger.warning(f"Failed to upsert SSO user {sso_user_id} into users table: {ue}")
 

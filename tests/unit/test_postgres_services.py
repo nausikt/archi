@@ -126,7 +126,26 @@ class TestUserService:
         
         assert user.id == "user123"
         assert user.auth_provider == "anonymous"
-    
+
+    def test_record_login_increments_count_and_stamps_time(self, mock_pool, mock_connection):
+        """record_login must bump login_count and set last_login_at=NOW() for the user — the SSO
+        callback upserts the user but never touched these, so logins were untracked (count stayed
+        0, last_login_at NULL)."""
+        conn, cursor = mock_connection
+        service = UserService(connection_pool=mock_pool, encryption_key="test-key")
+        # Ignore any setup (e.g. schema-ensure) the constructor ran on the shared mock conn.
+        conn.reset_mock()
+        cursor.reset_mock()
+
+        service.record_login("vkhlaisu")
+
+        sql, params = cursor.execute.call_args[0]
+        assert "UPDATE users" in sql
+        assert "login_count = login_count + 1" in sql
+        assert "last_login_at = NOW()" in sql
+        assert params == ("vkhlaisu",)
+        conn.commit.assert_called_once()
+
     def test_get_or_create_user_returns_existing(self, mock_pool, mock_connection):
         """Test returning existing user."""
         conn, cursor = mock_connection
@@ -1292,21 +1311,26 @@ def test_init_sql_conversations_has_no_playbook_name():
 class TestResolvePlaybookOwnerGaps:
     """Additional resolve_playbook_owner tests covering gaps not addressed above."""
 
-    def test_authed_logged_in_full_session_email_wins_over_all(self):
-        """When session_user has email, sub, id, and name all set, email wins (highest precedence)."""
+    def test_authed_logged_in_full_session_prefers_id(self):
+        """When session_user has email, sub, id, and name all set, the OIDC subject 'id' wins —
+        it is the key persisted as users.id and conversation_metadata.user_id, so playbook
+        ownership stays consistent with the rest of the identity model. email must NOT win
+        (it is mutable; precedence is id > sub > email; 'name' is never an owner key)."""
         owner, err = resolve_playbook_owner(
             auth_enabled=True,
             logged_in=True,
             session_user={"email": "a@b.c", "sub": "S", "id": "I", "name": "N"},
             request_client_id="different-uuid",
         )
-        assert owner == "a@b.c"
+        assert owner == "I"            # the OIDC subject ('id'), matching users.id
+        assert owner != "a@b.c"        # email must not win — mutable, would diverge from users.id
         assert err is None
         # client_id must be ignored — the IDOR fix
         assert owner != "different-uuid"
 
     def test_authed_logged_in_id_fallback_when_no_email_or_sub(self):
-        """When session_user has only 'id', it must be used (email > sub > id > name precedence)."""
+        """When session_user has only 'id', it must be used (precedence is id > sub > email;
+        'name' is never an owner key)."""
         owner, err = resolve_playbook_owner(
             auth_enabled=True,
             logged_in=True,
