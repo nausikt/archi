@@ -1018,8 +1018,12 @@ const UI = {
     document.querySelector('.playbook-cancel')?.addEventListener('click', () => {
       Chat._editingPlaybookId = null;
       Chat.setPlaybookEditorReadOnly(false);
-      const ed = document.querySelector('.playbooks-editor');
-      if (ed) ed.hidden = true;
+      Chat.showPlaybooksView('list');
+    });
+    document.querySelector('.playbooks-back')?.addEventListener('click', () => {
+      Chat._editingPlaybookId = null;
+      Chat.setPlaybookEditorReadOnly(false);
+      Chat.showPlaybooksView('list');
     });
     document.querySelector('.playbook-save')?.addEventListener('click', () => Chat.savePlaybookFromPanel());
     document.querySelector('.playbooks-new')?.addEventListener('click', () => {
@@ -1031,8 +1035,9 @@ const UI = {
       });
       const vis = document.querySelector('#playbook-visibility');
       if (vis) vis.value = 'private';
-      const ed = document.querySelector('.playbooks-editor');
-      if (ed) ed.hidden = false;
+      const status = document.querySelector('#playbooks-status');
+      if (status) status.textContent = '';
+      Chat.showPlaybooksView('editor', 'New playbook');
     });
     document.querySelector('.playbooks-export')?.addEventListener('click', async () => {
       try {
@@ -1116,8 +1121,10 @@ const UI = {
           document.querySelector('#playbook-description').value = playbook.description;
           document.querySelector('#playbook-visibility').value = playbook.visibility || 'private';
           document.querySelector('#playbook-body').value = playbook.body;
-          Chat.setPlaybookEditorReadOnly(!editBtn);  // View = read-only public playbook
-          document.querySelector('.playbooks-editor').hidden = false;
+          const status = document.querySelector('#playbooks-status');
+          if (status) status.textContent = '';
+          Chat.setPlaybookEditorReadOnly(!editBtn);  // View = read-only
+          Chat.showPlaybooksView('editor', editBtn ? 'Edit playbook' : playbook.name);
         } catch (err) {
           UI.showToast('Could not open playbook: ' + (err?.message || 'error'));
         }
@@ -5368,6 +5375,15 @@ const Chat = {
     }
   },
 
+  showPlaybooksView(view, title) {
+    const panel = document.querySelector('.playbooks-panel');
+    if (panel) panel.dataset.view = view;
+    const back = document.querySelector('.playbooks-back');
+    if (back) back.hidden = (view !== 'editor');
+    const titleEl = document.querySelector('#playbooks-title');
+    if (titleEl) titleEl.textContent = (view === 'editor' ? (title || 'Playbook') : 'Playbooks');
+  },
+
   openPlaybooksPanel() {
     const modal = document.querySelector('.playbooks-modal');
     if (!modal) return;
@@ -5375,6 +5391,7 @@ const Chat = {
     Chat._panelTab = 'mine';                          // always open on My playbooks
     const _search = document.querySelector('.playbooks-search');
     if (_search) _search.value = '';                  // start unfiltered each open
+    Chat.showPlaybooksView('list');
     this.loadPlaybooksPanel();
   },
 
@@ -5474,7 +5491,7 @@ const Chat = {
       else await API.createPlaybook({ name, description, body, visibility });
       if (status) { status.textContent = 'Saved.'; }
       this._editingPlaybookId = null;
-      document.querySelector('.playbooks-editor').hidden = true;
+      Chat.showPlaybooksView('list');
       await this.loadPlaybooksPanel();
       PlaybookMenu.playbooks = [];
     } catch (e) {

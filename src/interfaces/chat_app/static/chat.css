@@ -4009,6 +4009,8 @@ body {
 }
 
 .playbooks-body {
+  flex: 1 1 auto;
+  min-height: 0;
   padding: 16px 20px 20px;
   overflow-y: auto;
   display: flex;
@@ -4083,25 +4085,39 @@ body {
   border-bottom-color: var(--accent);
 }
 
-.playbooks-actions {
+/* master-detail view toggle */
+.playbooks-panel[data-view="list"] [data-when="editor"] { display: none; }
+.playbooks-panel[data-view="editor"] [data-when="list"] { display: none; }
+
+.playbooks-body--editor { gap: 8px; }
+
+.playbooks-footer {
   display: flex;
   gap: 8px;
-  padding-top: 4px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--border-color);
+  flex-shrink: 0;
 }
 
-.playbooks-editor {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 12px;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-md);
+.playbooks-footer--editor {
+  justify-content: flex-end;
 }
 
-/* display:flex above would defeat the `hidden` attribute the open/close logic uses */
-.playbooks-editor[hidden] {
-  display: none;
+.playbooks-back {
+  background: none;
+  border: none;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.playbooks-back:hover {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
 }
 
 #playbook-name,
@@ -4162,12 +4178,6 @@ body {
   min-height: 16px;
   font-size: var(--text-sm);
   color: var(--text-secondary);
-}
-
-.playbooks-editor-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
 }
 
 .playbook-save,
