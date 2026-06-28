@@ -1237,6 +1237,20 @@ class ChatWrapper:
                             "SELECT message_id, playbook_name FROM conversations "
                             "WHERE playbook_name IS NOT NULL ON CONFLICT (message_id) DO NOTHING"
                         )
+                    cursor.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS user_enabled_playbooks (
+                            user_id     VARCHAR(200) NOT NULL,
+                            playbook_id INTEGER NOT NULL REFERENCES playbooks(id) ON DELETE CASCADE,
+                            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            PRIMARY KEY (user_id, playbook_id)
+                        )
+                        """
+                    )
+                    cursor.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_user_enabled_playbooks_user "
+                        "ON user_enabled_playbooks(user_id)"
+                    )
                 conn.commit()
             finally:
                 conn.close()
@@ -1630,8 +1644,8 @@ class ChatWrapper:
                     if owner:
                         try:
                             playbook_service = PlaybookService(pg_config=self.pg_config)
-                            playbook = playbook_service.get_playbook_by_name(
-                                owner, stored_name, include_public=True
+                            playbook = playbook_service.resolve_invokable_playbook(
+                                owner, stored_name
                             )
                             body = playbook.body
                             foreign = playbook.owner_id != owner
@@ -2808,6 +2822,8 @@ class FlaskAppWrapper(object):
         self.add_endpoint('/api/playbooks/<int:playbook_id>', 'get_playbook', self.require_auth(self.get_playbook), methods=["GET"])
         self.add_endpoint('/api/playbooks/<int:playbook_id>', 'update_playbook', self.require_auth(self.update_playbook), methods=["PUT"])
         self.add_endpoint('/api/playbooks/<int:playbook_id>', 'delete_playbook', self.require_auth(self.delete_playbook), methods=["DELETE"])
+        self.add_endpoint('/api/playbooks/<int:playbook_id>/enable', 'enable_playbook', self.require_auth(self.enable_playbook), methods=["POST"])
+        self.add_endpoint('/api/playbooks/<int:playbook_id>/disable', 'disable_playbook', self.require_auth(self.disable_playbook), methods=["POST"])
 
         # Service status board endpoints (registered via Blueprint)
         logger.info("Adding service status board endpoints")
@@ -4225,8 +4241,8 @@ class FlaskAppWrapper(object):
         if not playbook_name or not playbook_owner:
             return
         try:
-            playbook = self._playbook_svc().get_playbook_by_name(
-                playbook_owner, playbook_name, include_public=True
+            playbook = self._playbook_svc().resolve_invokable_playbook(
+                playbook_owner, playbook_name
             )
             set_pending_playbook(
                 playbook.name, playbook.body, foreign=playbook.owner_id != playbook_owner,
@@ -4245,11 +4261,13 @@ class FlaskAppWrapper(object):
             if _err:
                 return _err
             svc = self._playbook_svc()
+            enabled_ids = svc.list_enabled_playbook_ids(owner_id)
             items = []
             for s in svc.list_playbooks(owner_id):
                 item = {
                     "id": s.id, "name": s.name, "description": s.description,
                     "visibility": s.visibility, "is_mine": s.owner_id == owner_id,
+                    "is_enabled": (s.owner_id == owner_id) or (s.id in enabled_ids),
                 }
                 # Owner identity is exposed only when auth verifies identities — in
                 # anonymous mode an owner id IS the credential and must not leak.
@@ -4281,6 +4299,40 @@ class FlaskAppWrapper(object):
             return jsonify({"error": f"Playbook {playbook_id} not found"}), 404
         except Exception as exc:
             logger.error(f"Error fetching playbook: {exc}")
+            return jsonify({"error": "Internal server error"}), 500
+
+    def enable_playbook(self, playbook_id):
+        """Add a public playbook to the caller's list (opt-in)."""
+        try:
+            body = request.get_json(silent=True) or {}
+            owner_id, _err = self._resolve_playbook_owner(
+                body.get("client_id") or request.args.get("client_id")
+            )
+            if _err:
+                return _err
+            self._playbook_svc().enable_playbook(owner_id, playbook_id)
+            return jsonify({"ok": True}), 200
+        except PlaybookNotFoundError:
+            return jsonify({"error": f"Playbook {playbook_id} not found"}), 404
+        except PlaybookValidationError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            logger.error(f"Error enabling playbook: {exc}")
+            return jsonify({"error": "Internal server error"}), 500
+
+    def disable_playbook(self, playbook_id):
+        """Remove a public playbook from the caller's list (opt-out)."""
+        try:
+            body = request.get_json(silent=True) or {}
+            owner_id, _err = self._resolve_playbook_owner(
+                body.get("client_id") or request.args.get("client_id")
+            )
+            if _err:
+                return _err
+            self._playbook_svc().disable_playbook(owner_id, playbook_id)
+            return jsonify({"ok": True}), 200
+        except Exception as exc:
+            logger.error(f"Error disabling playbook: {exc}")
             return jsonify({"error": "Internal server error"}), 500
 
     def create_playbook(self):

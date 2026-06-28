@@ -123,7 +123,7 @@ def _format_catalog_lines(playbooks, owner: str, max_desc: Optional[int] = None)
 def _safe_catalog(service: PlaybookService, owner: str) -> str:
     """One-line-per-playbook catalog that never raises — for tool error paths."""
     try:
-        playbooks = service.list_playbooks(owner, with_bodies=False)
+        playbooks = service.list_listing_playbooks(owner, with_bodies=False)
         if not playbooks:
             return "You have no saved playbooks yet."
         return _format_catalog_lines(playbooks, owner)
@@ -138,7 +138,7 @@ def format_playbook_listing(service: PlaybookService, owner: str) -> Optional[st
     the same behavior as Claude Code's empty skill_listing. One body-free query
     per call: this runs on every model step.
     """
-    playbooks = service.list_playbooks(owner, with_bodies=False)
+    playbooks = service.list_listing_playbooks(owner, with_bodies=False)
     if not playbooks:
         return None
     catalog = _format_catalog_lines(playbooks, owner)
@@ -230,9 +230,13 @@ def create_playbook_tool(
         if service is None or not owner:
             return "Playbooks are unavailable in this session."
         try:
-            playbook = service.get_playbook_by_name(owner, playbook, include_public=True)
+            playbook = service.resolve_invokable_playbook(owner, playbook)
         except PlaybookNotFoundError:
-            return f"No playbook named '{playbook}'. Available playbooks:\n{_safe_catalog(service, owner)}"
+            return (
+                f"No playbook named '{playbook}' is in your list. If it is a public playbook, "
+                f"ask the user to add it from the playbooks panel (or by selecting it in the /menu) "
+                f"first. Available now:\n{_safe_catalog(service, owner)}"
+            )
         except Exception as e:  # pragma: no cover - defensive
             logger.error("Playbook tool failed: %s", e)
             return f"Could not load playbook '{playbook}': {e}"

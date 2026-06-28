@@ -19,6 +19,7 @@ logger = get_logger(__name__)
 MAX_BODY_CHARS = 16384
 MAX_DESCRIPTION_CHARS = 1024
 MAX_PLAYBOOKS_PER_OWNER = 100
+MAX_ENABLED_PUBLIC_PER_USER = 100  # cap a user's public opt-ins (parity with MAX_PLAYBOOKS_PER_OWNER)
 
 
 @dataclass
@@ -196,6 +197,31 @@ class PlaybookService:
         finally:
             self._release_connection(conn)
 
+    def list_listing_playbooks(self, user_id: str, with_bodies: bool = False) -> List[Playbook]:
+        """The user's always-in-context set: their own playbooks PLUS the public ones
+        they've ENABLED. Unlike list_playbooks (which returns ALL public for the
+        management UI / slash menu), this is what gets injected into the model prompt —
+        bounded by the user's own count + their explicit opt-ins, so the shared public
+        library can never grow every user's prompt without bound (correctness bug #1)."""
+        body_col = "body" if with_bodies else "'' AS body"
+        conn = self._get_connection()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT id, name, description, {body_col}, owner_id, visibility, created_at, updated_at
+                    FROM playbooks
+                    WHERE owner_id = %s
+                       OR (visibility = 'public'
+                           AND id IN (SELECT playbook_id FROM user_enabled_playbooks WHERE user_id = %s))
+                    ORDER BY (owner_id = %s) DESC, name ASC
+                    """,
+                    (user_id, user_id, user_id),
+                )
+                return [self._row_to_playbook(row) for row in cursor.fetchall()]
+        finally:
+            self._release_connection(conn)
+
     def get_playbook(self, owner_id: str, playbook_id: int, include_public: bool = False) -> Playbook:
         """Fetch by id. Own playbooks only unless include_public (read-only sharing)."""
         conn = self._get_connection()
@@ -256,6 +282,35 @@ class PlaybookService:
         finally:
             self._release_connection(conn)
 
+    def resolve_invokable_playbook(self, user_id: str, name: str) -> Playbook:
+        """Resolve a playbook the user may RUN by name: their own, or a public one
+        they've ENABLED. A public playbook the user has not enabled is treated as not
+        found (the caller offers to add it). Own shadows a public of the same name;
+        among enabled-public the most recently updated wins."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, name, description, body, owner_id, visibility, created_at, updated_at
+                    FROM playbooks
+                    WHERE name = %s AND (
+                        owner_id = %s
+                        OR (visibility = 'public'
+                            AND id IN (SELECT playbook_id FROM user_enabled_playbooks WHERE user_id = %s))
+                    )
+                    ORDER BY (owner_id = %s) DESC, updated_at DESC
+                    LIMIT 1
+                    """,
+                    (name, user_id, user_id, user_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise PlaybookNotFoundError(f"Playbook '{name}' is not in your list")
+                return self._row_to_playbook(row)
+        finally:
+            self._release_connection(conn)
+
     def update_playbook(
         self,
         owner_id: str,
@@ -309,6 +364,70 @@ class PlaybookService:
                 if cursor.rowcount == 0:
                     raise PlaybookNotFoundError(f"Playbook {playbook_id} not found")
                 logger.info("Deleted playbook %s for owner %s", playbook_id, owner_id)
+        finally:
+            self._release_connection(conn)
+
+    def list_enabled_playbook_ids(self, user_id: str) -> set:
+        """The set of public playbook ids this user has opted into."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT playbook_id FROM user_enabled_playbooks WHERE user_id = %s",
+                    (user_id,),
+                )
+                return {row[0] for row in cursor.fetchall()}
+        finally:
+            self._release_connection(conn)
+
+    def enable_playbook(self, user_id: str, playbook_id: int) -> None:
+        """Opt the user into a public playbook (idempotent). Rejects another user's
+        private playbook (you may only enable public ones, or your own)."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                try:
+                    cursor.execute(
+                        "SELECT visibility, owner_id FROM playbooks WHERE id = %s", (playbook_id,)
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        raise PlaybookNotFoundError(f"Playbook {playbook_id} not found")
+                    visibility, owner_id = row
+                    if visibility != "public" and owner_id != user_id:
+                        raise PlaybookValidationError("Only public playbooks can be added to your list")
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM user_enabled_playbooks WHERE user_id = %s", (user_id,)
+                    )
+                    if cursor.fetchone()[0] >= MAX_ENABLED_PUBLIC_PER_USER:
+                        raise PlaybookValidationError(
+                            f"Enabled-playbook limit reached ({MAX_ENABLED_PUBLIC_PER_USER}); remove some first"
+                        )
+                    cursor.execute(
+                        """
+                        INSERT INTO user_enabled_playbooks (user_id, playbook_id)
+                        VALUES (%s, %s)
+                        ON CONFLICT (user_id, playbook_id) DO NOTHING
+                        """,
+                        (user_id, playbook_id),
+                    )
+                    conn.commit()
+                except (PlaybookNotFoundError, PlaybookValidationError):
+                    conn.rollback()
+                    raise
+        finally:
+            self._release_connection(conn)
+
+    def disable_playbook(self, user_id: str, playbook_id: int) -> None:
+        """Remove a user's opt-in (idempotent)."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM user_enabled_playbooks WHERE user_id = %s AND playbook_id = %s",
+                    (user_id, playbook_id),
+                )
+                conn.commit()
         finally:
             self._release_connection(conn)
 

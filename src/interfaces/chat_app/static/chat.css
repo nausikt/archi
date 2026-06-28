@@ -4039,6 +4039,50 @@ body {
   flex-shrink: 0;
 }
 
+.playbooks-search {
+  width: 100%;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  padding: 7px 10px;
+  outline: none;
+  transition: border-color var(--transition-fast);
+  box-sizing: border-box;
+}
+
+.playbooks-search:focus {
+  border-color: var(--accent);
+}
+
+.playbooks-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.playbooks-tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 8px 12px;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.playbooks-tab:hover {
+  color: var(--text-primary);
+}
+
+.playbooks-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
 .playbooks-actions {
   display: flex;
   gap: 8px;

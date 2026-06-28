@@ -525,6 +525,22 @@ const API = {
     return this.fetchJson(`${CONFIG.ENDPOINTS.PLAYBOOKS}?client_id=${encodeURIComponent(this.clientId)}`);
   },
 
+  async enablePlaybook(id) {
+    return this.fetchJson(`${CONFIG.ENDPOINTS.PLAYBOOKS}/${id}/enable`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: this.clientId }),
+    });
+  },
+
+  async disablePlaybook(id) {
+    return this.fetchJson(`${CONFIG.ENDPOINTS.PLAYBOOKS}/${id}/disable`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: this.clientId }),
+    });
+  },
+
   async getPlaybook(id) {
     return this.fetchJson(`${CONFIG.ENDPOINTS.PLAYBOOKS}/${id}?client_id=${encodeURIComponent(this.clientId)}`);
   },
@@ -1090,6 +1106,8 @@ const UI = {
       const editBtn = e.target.closest('.playbook-edit');
       const delBtn = e.target.closest('.playbook-delete');
       const viewBtn = e.target.closest('.playbook-view');
+      const addBtn = e.target.closest('.playbook-add');
+      const removeBtn = e.target.closest('.playbook-remove');
       if (editBtn || viewBtn) {
         try {
           const playbook = await API.getPlaybook((editBtn || viewBtn).dataset.id);
@@ -1113,7 +1131,30 @@ const UI = {
         } catch (err) {
           UI.showToast('Could not delete playbook: ' + (err?.message || 'error'));
         }
+      } else if (addBtn) {
+        try {
+          await API.enablePlaybook(addBtn.dataset.id);
+          await Chat.loadPlaybooksPanel();
+          PlaybookMenu.playbooks = [];
+        } catch (err) {
+          UI.showToast('Could not add playbook: ' + (err?.message || 'error'));
+        }
+      } else if (removeBtn) {
+        try {
+          await API.disablePlaybook(removeBtn.dataset.id);
+          await Chat.loadPlaybooksPanel();
+          PlaybookMenu.playbooks = [];
+        } catch (err) {
+          UI.showToast('Could not remove playbook: ' + (err?.message || 'error'));
+        }
       }
+    });
+    document.querySelector('.playbooks-search')?.addEventListener('input', () => Chat.renderPlaybooksPanel());
+    document.querySelector('.playbooks-tabs')?.addEventListener('click', (e) => {
+      const tabBtn = e.target.closest('.playbooks-tab');
+      if (!tabBtn) return;
+      Chat._panelTab = tabBtn.dataset.tab;
+      Chat.renderPlaybooksPanel();
     });
     // Resize handle for agent spec modal
     this.initAgentSpecResize();
@@ -3948,7 +3989,9 @@ const PlaybookMenu = {
     }
     // Prefix match (like shell/command autocomplete): "/cond" completes names that START with
     // "cond", not ones that merely contain it mid-string (which would make Tab pick the wrong playbook).
-    const matches = this.playbooks.filter(s => s.name.toLowerCase().startsWith(query));
+    // Only your list (own + enabled) appears in the menu; unadded public ones are added from the panel.
+    // NOTE: this.playbooks stays the FULL list — the send-time "Add & run?" guard relies on it.
+    const matches = this.playbooks.filter(s => s.is_enabled !== false && s.name.toLowerCase().startsWith(query));
     this.render(matches);
   },
 
@@ -4718,6 +4761,27 @@ const Chat = {
       return;
     }
 
+    // Guard: if the pending playbook is a public one the user hasn't enabled yet,
+    // confirm "add and run" before proceeding; abort cleanly on decline.
+    {
+      const guardName = API._pendingPlaybookName;
+      if (guardName) {
+        const list = PlaybookMenu.playbooks?.length
+          ? PlaybookMenu.playbooks
+          : ((await API.getPlaybooksList())?.playbooks || []);
+        const pb = list.find(p => p.name === guardName);
+        if (pb && pb.is_mine === false && !pb.is_enabled) {
+          const ok = window.confirm(`"/${guardName}" is a public playbook. Add it to your list and run it?`);
+          if (!ok) {
+            API._pendingPlaybookName = null;
+            return;
+          }
+          try { await API.enablePlaybook(pb.id); PlaybookMenu.playbooks = []; }
+          catch (err) { API._pendingPlaybookName = null; return; }
+        }
+      }
+    }
+
     // A /playbook invoke leaves "/name " in the input (autocomplete) — strip it so the stored
     // message, the bubble, and the conversation title stay clean. The playbook still applies via
     // the separately-sent playbook_name + the chip.
@@ -5308,6 +5372,9 @@ const Chat = {
     const modal = document.querySelector('.playbooks-modal');
     if (!modal) return;
     modal.style.display = 'flex';
+    Chat._panelTab = 'mine';                          // always open on My playbooks
+    const _search = document.querySelector('.playbooks-search');
+    if (_search) _search.value = '';                  // start unfiltered each open
     this.loadPlaybooksPanel();
   },
 
@@ -5317,33 +5384,71 @@ const Chat = {
   },
 
   async loadPlaybooksPanel() {
-    const list = document.querySelector('.playbooks-list');
-    if (!list) return;
+    if (!document.querySelector('.playbooks-list')) return;
     try {
       const data = await API.getPlaybooksList();
-      const playbooks = data?.playbooks || [];
-      list.innerHTML = playbooks.length
-        ? playbooks.map(s => {
-            const mine = s.is_mine !== false;  // default true for older payloads/mocks
-            // The server includes `owner` only in SSO mode (anon owner ids are credentials).
-            const badge = s.visibility === 'public'
-              ? `<span class="playbook-badge">public${!mine && s.owner ? ' · ' + Utils.escapeHtml(s.owner) : ''}</span>`
-              : '';
-            const actions = mine
-              ? `<button class="playbook-edit" data-id="${s.id}" type="button">Edit</button>
-                 <button class="playbook-delete" data-id="${s.id}" data-name="${Utils.escapeHtml(s.name)}" type="button">Delete</button>`
-              : `<button class="playbook-view" data-id="${s.id}" type="button">View</button>`;
-            return `
+      Chat._panelPlaybooks = data?.playbooks || [];
+    } catch (e) {
+      Chat._panelPlaybooks = null;  // signals "could not load"
+    }
+    Chat.renderPlaybooksPanel();
+  },
+
+  renderPlaybooksPanel() {
+    const list = document.querySelector('.playbooks-list');
+    const tabsEl = document.querySelector('.playbooks-tabs');
+    if (!list) return;
+    if (Chat._panelPlaybooks === null) {
+      if (tabsEl) tabsEl.innerHTML = '';
+      list.innerHTML = '<div class="playbooks-status">Could not load playbooks.</div>';
+      return;
+    }
+    const all = Chat._panelPlaybooks || [];
+    if (!all.length) {
+      if (tabsEl) tabsEl.innerHTML = '';
+      list.innerHTML = '<div class="playbook-menu-desc">No playbooks yet. Use "New playbook", or ask the agent to save one.</div>';
+      return;
+    }
+    const q = (document.querySelector('.playbooks-search')?.value || '').trim().toLowerCase();
+    const matchesQuery = (s) => !q
+      || s.name.toLowerCase().includes(q)
+      || (s.description || '').toLowerCase().includes(q);
+    const mine = all.filter(s => s.is_enabled !== false).filter(matchesQuery);
+    const pub = all.filter(s => s.is_enabled === false).filter(matchesQuery);
+
+    const tab = Chat._panelTab === 'public' ? 'public' : 'mine';  // default to My playbooks
+    if (tabsEl) {
+      tabsEl.innerHTML =
+        `<button class="playbooks-tab${tab === 'mine' ? ' active' : ''}" data-tab="mine" type="button" role="tab">My playbooks (${mine.length})</button>`
+        + `<button class="playbooks-tab${tab === 'public' ? ' active' : ''}" data-tab="public" type="button" role="tab">Public to add (${pub.length})</button>`;
+    }
+
+    const rowHtml = (s) => {
+      const isMine = s.is_mine !== false;
+      const badge = s.visibility === 'public'
+        ? `<span class="playbook-badge">public${!isMine && s.owner ? ' · ' + Utils.escapeHtml(s.owner) : ''}</span>`
+        : '';
+      const actions = isMine
+        ? `<button class="playbook-edit" data-id="${s.id}" type="button">Edit</button>
+           <button class="playbook-delete" data-id="${s.id}" data-name="${Utils.escapeHtml(s.name)}" type="button">Delete</button>`
+        : (s.is_enabled
+            ? `<button class="playbook-view" data-id="${s.id}" type="button">View</button>
+               <button class="playbook-remove" data-id="${s.id}" type="button">Remove from my list</button>`
+            : `<button class="playbook-view" data-id="${s.id}" type="button">View</button>
+               <button class="playbook-add" data-id="${s.id}" type="button">Add to my list</button>`);
+      return `
           <div class="playbook-row" data-id="${s.id}">
             <div><strong>${Utils.escapeHtml(s.name)}</strong>${badge}
               <div class="playbook-menu-desc">${Utils.escapeHtml(s.description || '')}</div></div>
             <div class="playbook-row-actions">${actions}</div>
           </div>`;
-          }).join('')
-        : '<div class="playbook-menu-desc">No playbooks yet. Use "New playbook", or ask the agent to save one.</div>';
-    } catch (e) {
-      list.innerHTML = '<div class="playbooks-status">Could not load playbooks.</div>';
-    }
+    };
+
+    const items = tab === 'mine' ? mine : pub;
+    const emptyMsg = q ? 'No matches.' : (tab === 'mine' ? 'Nothing here yet.' : 'None to add.');
+    list.innerHTML = items.length
+      ? items.map(rowHtml).join('')
+      : `<div class="playbook-menu-desc">${emptyMsg}</div>`;
   },
 
   setPlaybookEditorReadOnly(readOnly) {

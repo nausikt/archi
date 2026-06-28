@@ -660,6 +660,17 @@ CREATE TABLE IF NOT EXISTS conversation_playbook_turns (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Per-user opt-in to PUBLIC playbooks owned by others. A user's always-in-context
+-- listing AND their invokable set are their own playbooks PLUS the public ones they
+-- enable here — so the shared public library never bloats every user's prompt by default.
+CREATE TABLE IF NOT EXISTS user_enabled_playbooks (
+    user_id     VARCHAR(200) NOT NULL,                                   -- enrolling user (OIDC sub or client_id)
+    playbook_id INTEGER NOT NULL REFERENCES playbooks(id) ON DELETE CASCADE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, playbook_id)
+);
+CREATE INDEX IF NOT EXISTS idx_user_enabled_playbooks_user ON user_enabled_playbooks(user_id);
+
 -- ============================================================================
 -- NOTES
 -- ============================================================================
