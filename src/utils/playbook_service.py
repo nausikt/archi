@@ -10,6 +10,7 @@ import yaml
 from psycopg2 import errors as pg_errors
 
 from src.utils.logging import get_logger
+from src.utils.sql import SQL_INSERT_PLAYBOOK_TURN, SQL_LAST_PLAYBOOK_NAME_FOR_SENDER
 
 logger = get_logger(__name__)
 
@@ -428,6 +429,131 @@ class PlaybookService:
                     (user_id, playbook_id),
                 )
                 conn.commit()
+        finally:
+            self._release_connection(conn)
+
+    # ------------------------------------------------------------------
+    # Schema lifecycle
+    # ------------------------------------------------------------------
+
+    def ensure_schema(self) -> None:
+        """Create the playbook schema on pre-existing databases (idempotent).
+
+        init.sql only runs when the Postgres volume is first initialized, so a
+        deployment upgrading an existing volume would otherwise miss the
+        `playbooks` table, the `conversation_playbook_turns` side table and the
+        `user_enabled_playbooks` opt-in table entirely. A legacy
+        `conversations.playbook_name` column, if present from an earlier build,
+        is migrated over once and then left untouched. Raises on failure — the
+        service entrypoint decides whether that blocks startup.
+        """
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS playbooks (
+                        id          SERIAL PRIMARY KEY,
+                        name        VARCHAR(100) NOT NULL,
+                        description TEXT NOT NULL,
+                        body        TEXT NOT NULL,
+                        owner_id    VARCHAR(200) NOT NULL,
+                        visibility  VARCHAR(10) NOT NULL DEFAULT 'private',
+                        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_playbooks_owner_name "
+                    "ON playbooks(owner_id, name)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_playbooks_owner ON playbooks(owner_id)"
+                )
+                cursor.execute(
+                    "ALTER TABLE playbooks "
+                    "ADD COLUMN IF NOT EXISTS visibility VARCHAR(10) NOT NULL DEFAULT 'private'"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_playbooks_public ON playbooks(visibility) "
+                    "WHERE visibility = 'public'"
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS conversation_playbook_turns (
+                        message_id    INTEGER PRIMARY KEY REFERENCES conversations(message_id) ON DELETE CASCADE,
+                        playbook_name VARCHAR(100) NOT NULL,
+                        playbook_id   INTEGER,
+                        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                # One-time migration for DBs that still carry the legacy column: copy
+                # existing chips into the side table, then leave the dead column alone.
+                cursor.execute(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = 'conversations' "
+                    "AND column_name = 'playbook_name'"
+                )
+                if cursor.fetchone():
+                    cursor.execute(
+                        "INSERT INTO conversation_playbook_turns (message_id, playbook_name) "
+                        "SELECT message_id, playbook_name FROM conversations "
+                        "WHERE playbook_name IS NOT NULL ON CONFLICT (message_id) DO NOTHING"
+                    )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_enabled_playbooks (
+                        user_id     VARCHAR(200) NOT NULL,
+                        playbook_id INTEGER NOT NULL REFERENCES playbooks(id) ON DELETE CASCADE,
+                        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (user_id, playbook_id)
+                    )
+                    """
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_user_enabled_playbooks_user "
+                    "ON user_enabled_playbooks(user_id)"
+                )
+            conn.commit()
+        finally:
+            self._release_connection(conn)
+
+    # ------------------------------------------------------------------
+    # Per-turn side-table tracking (conversation_playbook_turns)
+    # ------------------------------------------------------------------
+
+    def record_playbook_turn(self, message_id, playbook_name, playbook_id=None) -> None:
+        """Record which playbook shaped a stored user turn (idempotent upsert).
+
+        No-op for a falsy message_id or playbook_name. Raises on DB errors —
+        the chat flow decides that a missing side table must not break the
+        conversation insert itself.
+        """
+        if not message_id or not playbook_name:
+            return
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(SQL_INSERT_PLAYBOOK_TURN, (message_id, playbook_name, playbook_id))
+            conn.commit()
+        finally:
+            self._release_connection(conn)
+
+    def last_playbook_name_for_sender(self, conversation_id, sender) -> Optional[str]:
+        """Stored playbook_name of the conversation's most recent `sender` turn, or None.
+
+        Used on refresh: the agent history query (SQL_QUERY_CONVO) only carries
+        (sender, content), so the chip name is fetched separately here. Raises on
+        DB errors — best-effort policy belongs to the caller.
+        """
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(SQL_LAST_PLAYBOOK_NAME_FOR_SENDER, (conversation_id, sender))
+                row = cursor.fetchone()
+                return row[0] if row else None
         finally:
             self._release_connection(conn)
 

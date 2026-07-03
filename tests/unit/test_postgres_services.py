@@ -1269,29 +1269,40 @@ def test_load_query_reads_playbook_from_side_table():
     assert "c.playbook_name" not in sql.SQL_QUERY_CONVO_WITH_FEEDBACK
 
 
-def test_last_user_playbook_name_uses_side_table_query():
-    """_last_user_playbook_name must issue SQL_LAST_PLAYBOOK_NAME_FOR_SENDER (side table), not
-    the old inline SELECT on conversations.playbook_name.
+def test_side_table_access_lives_on_playbook_service_not_app():
+    """Per-turn side-table access and the schema migration live on PlaybookService,
+    not on the Flask wrapper: app.py must not define the raw-SQL helpers and must
+    not embed side-table SQL inline.
 
     app.py cannot be imported in the unit-test environment (mistune, flask etc. absent), so
-    we verify the method source text directly via the raw file."""
+    we verify the source text directly via the raw file; the service methods themselves are
+    behaviorally covered in test_playbook_service.py."""
     import pathlib
+
+    from src.utils.playbook_service import PlaybookService
+
     app_src = (
         pathlib.Path(__file__).parent.parent.parent
         / "src" / "interfaces" / "chat_app" / "app.py"
     ).read_text()
 
-    # Locate just the method body so we don't match other code in the file.
-    method_start = app_src.index("def _last_user_playbook_name(")
-    # End at the next top-level def / class at the same indent (4 spaces).
-    method_body = app_src[method_start:app_src.index("\n    def ", method_start + 1)]
+    for moved_def in (
+        "def _last_user_playbook_name(",
+        "def _insert_playbook_turn(",
+        "def _ensure_playbook_schema(",
+    ):
+        assert moved_def not in app_src, f"{moved_def} moved to PlaybookService; app.py has it back"
+    assert "SELECT playbook_name FROM conversations" not in app_src, (
+        "app.py contains inline side-table SQL again"
+    )
+    assert "INSERT INTO conversation_playbook_turns" not in app_src, (
+        "app.py contains inline side-table SQL again"
+    )
 
-    assert "SELECT playbook_name FROM conversations" not in method_body, (
-        "_last_user_playbook_name still contains the old inline SQL"
-    )
-    assert "SQL_LAST_PLAYBOOK_NAME_FOR_SENDER" in method_body, (
-        "_last_user_playbook_name does not use SQL_LAST_PLAYBOOK_NAME_FOR_SENDER"
-    )
+    for service_method in ("record_playbook_turn", "last_playbook_name_for_sender", "ensure_schema"):
+        assert callable(getattr(PlaybookService, service_method, None)), (
+            f"PlaybookService.{service_method} is missing"
+        )
 
 
 def test_init_sql_conversations_has_no_playbook_name():

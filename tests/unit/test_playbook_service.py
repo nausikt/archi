@@ -2,6 +2,7 @@
 
 import pytest
 
+from src.utils import sql
 from src.utils.playbook_service import (
     MAX_ENABLED_PUBLIC_PER_USER,
     PlaybookNotFoundError,
@@ -110,3 +111,170 @@ def test_enable_playbook_enforces_cap(monkeypatch):
         svc.enable_playbook("user-B", 42)
     assert fake_cursor.executed_inserts == 0
     assert fake_conn.rollback_called, "rollback() must be called on the cap-exceeded path"
+
+
+# ---------------------------------------------------------------------------
+# Per-turn side-table helpers (moved here from the chat-app wrapper)
+# ---------------------------------------------------------------------------
+
+class _RecordingCursor(_FakeCursor):
+    """_FakeCursor that also records every (sql, params) pair executed."""
+
+    def __init__(self, fetchone_values=None):
+        super().__init__(fetchone_values)
+        self.executed = []
+
+    def execute(self, statement, params=None):
+        self.executed.append((statement, params))
+        super().execute(statement, params)
+
+
+def test_last_playbook_name_for_sender_returns_stored_name(monkeypatch):
+    svc = PlaybookService(pg_config={"dummy": True})
+    cursor = _RecordingCursor(fetchone_values=[("transfer-check",)])
+    monkeypatch.setattr(svc, "_get_connection", lambda: _FakeConn(cursor))
+    monkeypatch.setattr(svc, "_release_connection", lambda conn: None)
+    assert svc.last_playbook_name_for_sender(7, "user") == "transfer-check"
+    statement, params = cursor.executed[0]
+    assert statement == sql.SQL_LAST_PLAYBOOK_NAME_FOR_SENDER
+    assert params == (7, "user")
+
+
+def test_last_playbook_name_for_sender_none_for_plain_newest_turn(monkeypatch):
+    """LEFT JOIN semantics: a newest sender turn without a playbook yields (None,) —
+    the method must return None, not splice in an older turn's playbook."""
+    svc = PlaybookService(pg_config={"dummy": True})
+    cursor = _RecordingCursor(fetchone_values=[(None,)])
+    monkeypatch.setattr(svc, "_get_connection", lambda: _FakeConn(cursor))
+    monkeypatch.setattr(svc, "_release_connection", lambda conn: None)
+    assert svc.last_playbook_name_for_sender(7, "user") is None
+
+
+def test_last_playbook_name_for_sender_none_when_no_rows(monkeypatch):
+    svc = PlaybookService(pg_config={"dummy": True})
+    cursor = _RecordingCursor(fetchone_values=[])
+    monkeypatch.setattr(svc, "_get_connection", lambda: _FakeConn(cursor))
+    monkeypatch.setattr(svc, "_release_connection", lambda conn: None)
+    assert svc.last_playbook_name_for_sender(7, "user") is None
+
+
+def test_last_playbook_name_for_sender_raises_on_db_error(monkeypatch):
+    """The service reports DB errors; best-effort policy lives at the chat-app call site."""
+    svc = PlaybookService(pg_config={"dummy": True})
+
+    def boom():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(svc, "_get_connection", boom)
+    with pytest.raises(RuntimeError, match="db down"):
+        svc.last_playbook_name_for_sender(7, "user")
+
+
+class _RecordingConn(_FakeConn):
+    """_FakeConn that also records whether commit() was called."""
+
+    def __init__(self, cursor):
+        super().__init__(cursor)
+        self.committed = False
+
+    def commit(self):
+        self.committed = True
+
+
+def test_record_playbook_turn_executes_upsert(monkeypatch):
+    svc = PlaybookService(pg_config={"dummy": True})
+    cursor = _RecordingCursor()
+    conn = _RecordingConn(cursor)
+    monkeypatch.setattr(svc, "_get_connection", lambda: conn)
+    monkeypatch.setattr(svc, "_release_connection", lambda c: None)
+    svc.record_playbook_turn(11, "rucio-triage", 3)
+    statement, params = cursor.executed[0]
+    assert statement == sql.SQL_INSERT_PLAYBOOK_TURN
+    assert params == (11, "rucio-triage", 3)
+    assert conn.committed
+
+
+def test_record_playbook_turn_skips_without_message_id_or_name(monkeypatch):
+    """Falsy message_id or playbook_name is a no-op that never touches the DB."""
+    svc = PlaybookService(pg_config={"dummy": True})
+
+    def no_connect():
+        raise AssertionError("record_playbook_turn must not connect for a no-op")
+
+    monkeypatch.setattr(svc, "_get_connection", no_connect)
+    svc.record_playbook_turn(None, "rucio-triage")
+    svc.record_playbook_turn(11, None)
+    svc.record_playbook_turn(0, "")
+
+
+def test_record_playbook_turn_raises_on_db_error(monkeypatch):
+    """The service reports DB errors; the chat flow decides that a missing side
+    table must not break the conversation insert."""
+    svc = PlaybookService(pg_config={"dummy": True})
+
+    def boom():
+        raise RuntimeError("side table missing")
+
+    monkeypatch.setattr(svc, "_get_connection", boom)
+    with pytest.raises(RuntimeError, match="side table missing"):
+        svc.record_playbook_turn(11, "rucio-triage")
+
+
+# ---------------------------------------------------------------------------
+# ensure_schema (moved here from the chat-app wrapper's _ensure_playbook_schema)
+# ---------------------------------------------------------------------------
+
+def _run_ensure_schema(monkeypatch, fetchone_values):
+    svc = PlaybookService(pg_config={"dummy": True})
+    cursor = _RecordingCursor(fetchone_values=fetchone_values)
+    conn = _RecordingConn(cursor)
+    monkeypatch.setattr(svc, "_get_connection", lambda: conn)
+    monkeypatch.setattr(svc, "_release_connection", lambda c: None)
+    svc.ensure_schema()
+    return cursor, conn
+
+
+def test_ensure_schema_creates_playbook_schema_idempotently(monkeypatch):
+    """Both tables + the opt-in table are created, every DDL is IF NOT EXISTS
+    (safe to re-run on every service start), and the work is committed."""
+    cursor, conn = _run_ensure_schema(monkeypatch, fetchone_values=[None])
+    blob = "\n".join(statement for statement, _ in cursor.executed)
+    assert "CREATE TABLE IF NOT EXISTS playbooks" in blob
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS idx_playbooks_owner_name" in blob
+    assert "ADD COLUMN IF NOT EXISTS visibility" in blob
+    assert "CREATE TABLE IF NOT EXISTS conversation_playbook_turns" in blob
+    assert "CREATE TABLE IF NOT EXISTS user_enabled_playbooks" in blob
+    for statement, _ in cursor.executed:
+        if statement.strip().upper().startswith(("CREATE TABLE", "CREATE INDEX", "CREATE UNIQUE INDEX")):
+            assert "IF NOT EXISTS" in statement, f"non-idempotent DDL: {statement[:60]}"
+    assert conn.committed
+
+
+def test_ensure_schema_skips_legacy_copy_without_column(monkeypatch):
+    """No legacy conversations.playbook_name column -> no copy INSERT is issued."""
+    cursor, _ = _run_ensure_schema(monkeypatch, fetchone_values=[None])
+    assert not any(
+        "INSERT INTO conversation_playbook_turns" in statement for statement, _ in cursor.executed
+    )
+
+
+def test_ensure_schema_copies_legacy_column_when_present(monkeypatch):
+    """A legacy column is migrated once, guarded by information_schema, idempotently."""
+    cursor, _ = _run_ensure_schema(monkeypatch, fetchone_values=[(1,)])
+    copies = [s for s, _ in cursor.executed if "INSERT INTO conversation_playbook_turns" in s]
+    assert len(copies) == 1
+    assert "FROM conversations" in copies[0]
+    assert "ON CONFLICT (message_id) DO NOTHING" in copies[0]
+
+
+def test_ensure_schema_raises_on_db_error(monkeypatch):
+    """ensure_schema reports failures; the entrypoint decides that a failed
+    migration must not block service startup."""
+    svc = PlaybookService(pg_config={"dummy": True})
+
+    def boom():
+        raise RuntimeError("no database")
+
+    monkeypatch.setattr(svc, "_get_connection", boom)
+    with pytest.raises(RuntimeError, match="no database"):
+        svc.ensure_schema()
