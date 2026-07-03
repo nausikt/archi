@@ -808,7 +808,6 @@ const UI = {
       agentDropdownLabel: document.querySelector('.agent-dropdown-label'),
       agentDropdownList: document.querySelector('.agent-dropdown-list'),
       agentDropdownAdd: document.querySelector('.agent-dropdown-add'),
-      playbooksBtn: document.querySelector('.agent-dropdown-playbooks'),
       agentInfoModal: document.querySelector('.agent-info-modal'),
       agentInfoBackdrop: document.querySelector('.agent-info-backdrop'),
       agentInfoClose: document.querySelector('.agent-info-close'),
@@ -957,10 +956,6 @@ const UI = {
         console.error('Failed to open agent spec editor:', e);
       }
     });
-    this.elements.playbooksBtn?.addEventListener('click', () => {
-      this.closeAgentDropdown();
-      Chat.openPlaybooksPanel();
-    });
     this.elements.agentDropdownList?.addEventListener('click', (e) => {
       const target = e.target;
       const row = target.closest('.agent-dropdown-item');
@@ -1012,9 +1007,7 @@ const UI = {
     this.elements.agentSpecSave?.addEventListener('click', () => {
       this.saveAgentSpec();
     });
-    // Playbooks panel bindings
-    document.querySelector('.playbooks-backdrop')?.addEventListener('click', () => Chat.closePlaybooksPanel());
-    document.querySelector('.playbooks-close')?.addEventListener('click', () => Chat.closePlaybooksPanel());
+    // Playbooks section bindings (hosted in the Settings modal)
     document.querySelector('.playbook-cancel')?.addEventListener('click', () => {
       Chat._editingPlaybookId = null;
       Chat.setPlaybookEditorReadOnly(false);
@@ -1284,8 +1277,6 @@ const UI = {
       if (e.key === 'Escape' && this.elements.agentInfoModal?.style.display !== 'none') {
         this.closeAgentInfo();
       }
-      const sm = document.querySelector('.playbooks-modal');
-      if (e.key === 'Escape' && sm && sm.style.display !== 'none') { Chat.closePlaybooksPanel(); }
     });
 
     document.addEventListener('click', (e) => {
@@ -1335,6 +1326,10 @@ const UI = {
     if (targetSection) {
       targetSection.classList.add('active');
       targetSection.hidden = false;
+    }
+
+    if (sectionId === 'playbooks' && typeof Chat !== 'undefined') {
+      Chat.enterPlaybooksSection();
     }
   },
 
@@ -5384,20 +5379,14 @@ const Chat = {
     if (titleEl) titleEl.textContent = (view === 'editor' ? (title || 'Playbook') : 'Playbooks');
   },
 
-  openPlaybooksPanel() {
-    const modal = document.querySelector('.playbooks-modal');
-    if (!modal) return;
-    modal.style.display = 'flex';
-    Chat._panelTab = 'mine';                          // always open on My playbooks
+  enterPlaybooksSection() {
+    // Called whenever Settings switches to the Playbooks section: reset to the
+    // Active tab, unfiltered, list view, and (re)load the catalog.
+    Chat._panelTab = 'mine';
     const _search = document.querySelector('.playbooks-search');
     if (_search) _search.value = '';                  // start unfiltered each open
     Chat.showPlaybooksView('list');
     this.loadPlaybooksPanel();
-  },
-
-  closePlaybooksPanel() {
-    const modal = document.querySelector('.playbooks-modal');
-    if (modal) modal.style.display = 'none';
   },
 
   async loadPlaybooksPanel() {
@@ -5433,11 +5422,11 @@ const Chat = {
     const mine = all.filter(s => s.is_enabled !== false).filter(matchesQuery);
     const pub = all.filter(s => s.is_enabled === false).filter(matchesQuery);
 
-    const tab = Chat._panelTab === 'public' ? 'public' : 'mine';  // default to My playbooks
+    const tab = Chat._panelTab === 'public' ? 'public' : 'mine';  // default to Active
     if (tabsEl) {
       tabsEl.innerHTML =
-        `<button class="playbooks-tab${tab === 'mine' ? ' active' : ''}" data-tab="mine" type="button" role="tab">My playbooks (${mine.length})</button>`
-        + `<button class="playbooks-tab${tab === 'public' ? ' active' : ''}" data-tab="public" type="button" role="tab">Public to add (${pub.length})</button>`;
+        `<button class="playbooks-tab${tab === 'mine' ? ' active' : ''}" data-tab="mine" type="button" role="tab">Active (${mine.length})</button>`
+        + `<button class="playbooks-tab${tab === 'public' ? ' active' : ''}" data-tab="public" type="button" role="tab">Add from public (${pub.length})</button>`;
     }
 
     const rowHtml = (s) => {
@@ -5450,9 +5439,9 @@ const Chat = {
            <button class="playbook-delete" data-id="${s.id}" data-name="${Utils.escapeHtml(s.name)}" type="button">Delete</button>`
         : (s.is_enabled
             ? `<button class="playbook-view" data-id="${s.id}" type="button">View</button>
-               <button class="playbook-remove" data-id="${s.id}" type="button">Remove from my list</button>`
+               <button class="playbook-remove" data-id="${s.id}" type="button">Remove</button>`
             : `<button class="playbook-view" data-id="${s.id}" type="button">View</button>
-               <button class="playbook-add" data-id="${s.id}" type="button">Add to my list</button>`);
+               <button class="playbook-add" data-id="${s.id}" type="button">Add</button>`);
       return `
           <div class="playbook-row" data-id="${s.id}">
             <div><strong>${Utils.escapeHtml(s.name)}</strong>${badge}
@@ -5463,9 +5452,19 @@ const Chat = {
 
     const items = tab === 'mine' ? mine : pub;
     const emptyMsg = q ? 'No matches.' : (tab === 'mine' ? 'Nothing here yet.' : 'None to add.');
-    list.innerHTML = items.length
-      ? items.map(rowHtml).join('')
-      : `<div class="playbook-menu-desc">${emptyMsg}</div>`;
+    if (!items.length) {
+      list.innerHTML = `<div class="playbook-menu-desc">${emptyMsg}</div>`;
+    } else if (tab === 'mine') {
+      // The Active tab groups what you own and what you added from public.
+      const yours = items.filter(s => s.is_mine !== false);
+      const added = items.filter(s => s.is_mine === false);
+      let html = '';
+      if (yours.length) html += `<div class="playbooks-group-title">Yours</div>` + yours.map(rowHtml).join('');
+      if (added.length) html += `<div class="playbooks-group-title">Added from public</div>` + added.map(rowHtml).join('');
+      list.innerHTML = html;
+    } else {
+      list.innerHTML = items.map(rowHtml).join('');
+    }
   },
 
   setPlaybookEditorReadOnly(readOnly) {
