@@ -607,6 +607,14 @@ CREATE TABLE IF NOT EXISTS conversation_playbook_turns (
     created_at    TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS user_enabled_playbooks (
+    user_id     VARCHAR(200) NOT NULL,
+    playbook_id INTEGER NOT NULL REFERENCES playbooks(id) ON DELETE CASCADE,
+    created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, playbook_id)
+);
+CREATE INDEX IF NOT EXISTS idx_user_enabled_playbooks_user ON user_enabled_playbooks(user_id);
+
 -- ============================================================================
 -- NOTES
 -- ============================================================================
