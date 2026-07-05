@@ -4754,7 +4754,7 @@ class FlaskAppWrapper(object):
             'conversation_id': conversation_id,
             'archi_msg_id': message_ids[-1],
             'server_response_msg_ts': timestamps['server_response_msg_ts'].timestamp(),
-            'model_used': model,
+            'model_used': self.chat.current_model_used,
             'final_response_msg_ts': datetime.now(timezone.utc).timestamp(),
         }
 
