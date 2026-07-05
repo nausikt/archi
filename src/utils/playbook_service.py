@@ -38,6 +38,7 @@ class Playbook:
 
 VISIBILITY_VALUES = ("private", "public")
 
+SYSTEM_OWNER = "system"  # owner_id sentinel: public playbooks that are default-on for all users
 
 class PlaybookError(Exception):
     """Base class for playbook service errors."""
@@ -213,11 +214,12 @@ class PlaybookService:
                     SELECT id, name, description, {body_col}, owner_id, visibility, created_at, updated_at
                     FROM playbooks
                     WHERE owner_id = %s
+                       OR (visibility = 'public' AND owner_id = %s)
                        OR (visibility = 'public'
                            AND id IN (SELECT playbook_id FROM user_enabled_playbooks WHERE user_id = %s))
                     ORDER BY (owner_id = %s) DESC, name ASC
                     """,
-                    (user_id, user_id, user_id),
+                    (user_id, SYSTEM_OWNER, user_id, user_id),
                 )
                 return [self._row_to_playbook(row) for row in cursor.fetchall()]
         finally:
@@ -297,13 +299,14 @@ class PlaybookService:
                     FROM playbooks
                     WHERE name = %s AND (
                         owner_id = %s
+                        OR (visibility = 'public' AND owner_id = %s)
                         OR (visibility = 'public'
                             AND id IN (SELECT playbook_id FROM user_enabled_playbooks WHERE user_id = %s))
                     )
                     ORDER BY (owner_id = %s) DESC, updated_at DESC
                     LIMIT 1
                     """,
-                    (name, user_id, user_id, user_id),
+                    (name, user_id, SYSTEM_OWNER, user_id, user_id),
                 )
                 row = cursor.fetchone()
                 if row is None:
@@ -374,8 +377,12 @@ class PlaybookService:
         try:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    "SELECT playbook_id FROM user_enabled_playbooks WHERE user_id = %s",
-                    (user_id,),
+                    """
+                    SELECT playbook_id FROM user_enabled_playbooks WHERE user_id = %s
+                    UNION
+                    SELECT id FROM playbooks WHERE visibility = 'public' AND owner_id = %s
+                    """,
+                    (user_id, SYSTEM_OWNER),
                 )
                 return {row[0] for row in cursor.fetchall()}
         finally:
