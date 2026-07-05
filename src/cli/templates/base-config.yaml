@@ -41,6 +41,12 @@ mcp_servers:
     {%- if server_config.skill is defined %}
     skill: {{ server_config.skill }}
     {%- endif %}
+    {%- if server_config.forward_sso_token is defined %}
+    forward_sso_token: {{ server_config.forward_sso_token | tojson }}
+    {%- endif %}
+    {%- if server_config.sso_aud is defined %}
+    sso_aud: {{ server_config.sso_aud }}
+    {%- endif %}
   {%- endfor %}
 
 services:
