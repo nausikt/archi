@@ -49,6 +49,7 @@ from src.utils.env import read_secret, read_or_create_persistent_secret
 from src.utils.logging import get_logger
 from src.utils.config_access import get_full_config, get_services_config, get_global_config, get_dynamic_config
 from src.utils.config_service import ConfigService, StaticConfig
+from src.utils.token_service import TokenService
 from src.utils.sql import (
     SQL_INSERT_CONVO, SQL_INSERT_FEEDBACK, SQL_INSERT_TIMING, SQL_QUERY_CONVO,
     SQL_CREATE_CONVERSATION, SQL_UPDATE_CONVERSATION_TIMESTAMP,
@@ -2579,6 +2580,11 @@ class FlaskAppWrapper(object):
         if self.sso_enabled:
             self._setup_sso()
 
+        self._forward_sso_enabled = any(
+            isinstance(s, dict) and s.get("forward_sso_token")
+            for s in (self.config.get("mcp_servers") or {}).values()
+        )
+
         # create the chat from the wrapper and ensure default config is active
         self.chat = ChatWrapper()
         self.chat.update_config(config_name=self.config["name"])
@@ -2745,6 +2751,14 @@ class FlaskAppWrapper(object):
         session['auth_method'] = auth_method
         session['roles'] = roles if roles is not None else []
 
+    @property
+    def token_service(self) -> TokenService:
+        svc = getattr(self, '_token_service_instance', None)
+        if svc is None:
+            svc = TokenService(pg_config=self.pg_config)
+            self._token_service_instance = svc
+        return svc
+
     def _get_session_user_email(self) -> str:
         """Get user email from session. Returns empty string if not logged in."""
         if not session.get('logged_in'):
@@ -2837,6 +2851,12 @@ class FlaskAppWrapper(object):
         session.pop('logged_in', None)
         session.pop('auth_method', None)
         session.pop('roles', None)
+        sso_sid = session.pop('sso_sid', None)
+        if sso_sid and self._forward_sso_enabled:
+            try:
+                self.token_service.revoke_session(sso_sid=sso_sid)
+            except Exception as te:
+                logger.warning("Failed to revoke SSO token on logout: %s", te)
         
         # Log logout event
         log_authentication_event(
@@ -2889,6 +2909,27 @@ class FlaskAppWrapper(object):
                     user_service.record_login(sso_user_id)
                 except Exception as ue:
                     logger.warning(f"Failed to upsert SSO user {sso_user_id} into users table: {ue}")
+            
+            if self._forward_sso_enabled and token.get('access_token') and self.token_service.enabled:
+                try:
+                    sso_sid = TokenService.mint_sso_sid()
+                    access_expires_at = int(
+                        token.get('expires_at')
+                        or (time.time() + int(token.get('expires_in') or 0))
+                    )
+                    session_expires_at = int(time.time() + 12 * 3600)
+                    stored = self.token_service.store_sso_token(
+                        sso_sid=sso_sid,
+                        user_id=sso_user_id,
+                        access_token=token['access_token'],
+                        refresh_token=token.get('refresh_token'),
+                        access_expires_at=access_expires_at,
+                        session_expires_at=session_expires_at,
+                    )
+                    if stored:
+                        session['sso_sid'] = sso_sid
+                except Exception as te:
+                    logger.warning("Failed to store SSO token for user %s: %s", sso_user_id, te)
 
             # Store user information in session (normalized structure)
             self._set_user_session(
