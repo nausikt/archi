@@ -157,7 +157,10 @@ services:
       - {{ secret.lower() }}
       {% endfor %}
     volumes:
-      - {{ data_manager_volume_name }}:/root/data/
+      # Share the data-manager volume when that service is deployed; otherwise
+      # (ingestion deprecated / data-manager disabled) fall back to the
+      # chatbot's own volume so /root/data still has a persistent mount.
+      - {{ data_manager_volume_name if data_manager_enabled else chatbot_volume_name }}:/root/data/
       - ./configs:/root/archi/configs
       - ./data/prompts:/root/archi/data/prompts:ro
       - ./data/agents:/root/archi/agents
