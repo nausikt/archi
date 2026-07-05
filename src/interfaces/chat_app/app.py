@@ -71,6 +71,7 @@ from src.archi.pipelines.agents.tools.playbook_tools import (
 )
 from src.interfaces.chat_app.document_utils import *
 from src.interfaces.chat_app.playbook_routes import register_playbooks
+from src.interfaces.chat_app.crab_routes import register_crab_routes
 from src.interfaces.chat_app.service_alerts import (
     register_service_alerts, get_active_banner_alerts, is_alert_manager,
 )
@@ -2756,6 +2757,22 @@ class FlaskAppWrapper(object):
             require_auth=self.require_auth,
             resolve_owner=self._resolve_playbook_owner,
             playbook_svc=self._playbook_svc,
+        )
+
+        # CRAB task prefetch + autocomplete endpoints (registered via
+        # Blueprint). No-op on non-CRAB deployments: the routes return empty
+        # results when the active pipeline does not expose
+        # ``prefetch_user_task_summaries``.
+        logger.info("Adding CRAB tasks API endpoints")
+        register_crab_routes(
+            self.app,
+            auth_enabled=self.auth_enabled,
+            require_auth=self.require_auth,
+            get_pipeline=lambda: getattr(
+                getattr(self, "chat", None), "archi", None
+            ) and getattr(self.chat.archi, "pipeline", None),
+            token_service_getter=lambda: self.token_service,
+            refresher_factory=self._refresh_sso_token_callable,
         )
 
         # Service status board endpoints (registered via Blueprint)
