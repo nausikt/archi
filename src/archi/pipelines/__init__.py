@@ -10,6 +10,7 @@ _PIPELINE_EXPORTS = {
     "QAPipeline": (".classic_pipelines.qa", "QAPipeline"),
     "BaseReActAgent": (".agents.base_react", "BaseReActAgent"),
     "CMSCompOpsAgent": (".agents.cms_comp_ops_agent", "CMSCompOpsAgent"),
+    "CMSCRABAgent": (".agents.cms_crab", "CMSCRABAgent"),
 }
 
 __all__ = list(_PIPELINE_EXPORTS)
