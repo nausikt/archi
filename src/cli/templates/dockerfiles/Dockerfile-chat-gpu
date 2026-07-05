@@ -73,6 +73,13 @@ COPY pyproject.toml pyproject.toml
 COPY weblists weblists
 RUN pip install --upgrade pip && pip install .
 
+# Workaround: a2rchi-pytorch-base may still ship langchain-mcp-adapters 0.1.x,
+# which lacks langchain_mcp_adapters.interceptors (required by CMS CRAB MCP).
+RUN pip install --no-cache-dir \
+    "langchain-mcp-adapters==0.2.2" \
+    "mcp>=1.9.2,<2" \
+    && python -c "from langchain_mcp_adapters.interceptors import MCPToolCallRequest; assert MCPToolCallRequest"
+
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 ARG APP_VERSION=unknown
