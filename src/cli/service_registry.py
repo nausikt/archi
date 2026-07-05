@@ -67,8 +67,12 @@ class ServiceRegistry:
             name='data-manager',
             description='Ingestion service for sources and manual uploads',
             category='infrastructure',
+            # Ingestion is deprecated for archi-crab: the data-manager service is
+            # no longer auto-deployed. The chatbot serves RAG in-process from
+            # pgvector, so it does not need this service running. Enable it
+            # explicitly via --services if one-off ingestion is ever required.
             requires_volume=True,
-            auto_enable=True,
+            auto_enable=False,
             default_host_port=7871,
             default_container_port=7871,
             port_config_path='services.data_manager',
