@@ -2281,6 +2281,45 @@ class ChatWrapper:
             requested_config = self._resolve_config_name(config_name)
             self.update_config(config_name=requested_config)
             
+            pipeline = getattr(self.archi, "pipeline", None)
+            build_user_tools = getattr(pipeline, "build_user_scoped_mcp_tools", None)
+
+            # Per-turn user-scoped MCP tool injection. Pulls the caller's CERN
+            # SSO access token from Postgres (refreshing transparently near
+            # expiry) and mounts any MCP servers flagged forward_sso_token for
+            # this turn. No token / no flagged servers => no-op.
+            user_scoped_tools: list = []
+            try:
+                if pipeline is not None and callable(build_user_tools):
+                    sso_sid = session.get("sso_sid")
+                    app_wrapper = getattr(self, "app_wrapper", None)
+
+                    def mcp_access_token_getter() -> Optional[str]:
+                        if not sso_sid or app_wrapper is None:
+                            return None
+                        token_service = getattr(app_wrapper, "token_service", None)
+                        if token_service is None:
+                            return None
+                        refresher = app_wrapper._refresh_sso_token_callable()
+                        return token_service.get_access_token(
+                            sso_sid=sso_sid,
+                            refresher=refresher,
+                        )
+
+                    access_token = mcp_access_token_getter()
+                    user_scoped_tools = (
+                        build_user_tools(
+                            access_token,
+                            token_getter=mcp_access_token_getter,
+                        )
+                        or []
+                    )
+                    pipeline.refresh_agent(extra_tools=user_scoped_tools)
+            except Exception as mcp_exc:
+                logger.warning(
+                    "User-scoped MCP injection failed; continuing without it: %s",
+                    mcp_exc,
+                )
             # If provider and model are specified in the context, override the pipeline's LLM
             provider = context.provider_used
             model = context.model_used
@@ -2292,7 +2331,9 @@ class ChatWrapper:
                         self.archi.pipeline.agent_llm = override_llm
                         # Force agent refresh to use new LLM
                         if hasattr(self.archi.pipeline, 'refresh_agent'):
-                            self.archi.pipeline.refresh_agent(force=True)
+                            self.archi.pipeline.refresh_agent(
+                                force=True, extra_tools=user_scoped_tools
+                            )
                         logger.info(f"Overrode pipeline LLM with {provider}/{model}")
                 except ValueError as e:
                     logger.warning(f"Failed to create provider LLM {provider}/{model}: {e}")
@@ -2587,6 +2628,7 @@ class FlaskAppWrapper(object):
 
         # create the chat from the wrapper and ensure default config is active
         self.chat = ChatWrapper()
+        self.chat.app_wrapper = self
         self.chat.update_config(config_name=self.config["name"])
 
         # enable CORS:
@@ -2758,6 +2800,26 @@ class FlaskAppWrapper(object):
             svc = TokenService(pg_config=self.pg_config)
             self._token_service_instance = svc
         return svc
+
+    def _refresh_sso_token_callable(self):
+        """Build a refresher callable for TokenService.get_access_token.
+        Returns a function that takes a refresh_token string and returns the
+        new authlib token dict (or None on failure). Wraps Authlib's
+        fetch_access_token so the TokenService stays framework-agnostic.
+        """
+        oauth = getattr(self, 'oauth', None)
+        if not oauth:
+            return None
+        def _refresh(refresh_token: str):
+            try:
+                return oauth.sso.fetch_access_token(
+                    refresh_token=refresh_token,
+                    grant_type='refresh_token',
+                )
+            except Exception as exc:
+                logger.warning("SSO refresh_token exchange failed: %s", exc)
+                return None
+        return _refresh
 
     def _get_session_user_email(self) -> str:
         """Get user email from session. Returns empty string if not logged in."""
