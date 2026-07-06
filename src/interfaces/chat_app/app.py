@@ -56,7 +56,8 @@ from src.utils.sql import (
     SQL_LIST_CONVERSATIONS, SQL_GET_CONVERSATION_METADATA, SQL_DELETE_CONVERSATION,
     SQL_LIST_CONVERSATIONS_BY_USER, SQL_GET_CONVERSATION_METADATA_BY_USER,
     SQL_DELETE_CONVERSATION_BY_USER, SQL_UPDATE_CONVERSATION_TIMESTAMP_BY_USER,
-    SQL_INSERT_TOOL_CALLS, SQL_QUERY_CONVO_WITH_FEEDBACK, SQL_DELETE_REACTION_FEEDBACK,
+    SQL_INSERT_TOOL_CALLS, SQL_QUERY_CONVO_WITH_FEEDBACK,
+    SQL_QUERY_CONVO_WITH_FEEDBACK_NO_PLAYBOOKS, SQL_DELETE_REACTION_FEEDBACK,
     SQL_GET_REACTION_FEEDBACK,
     SQL_CREATE_AGENT_TRACE, SQL_UPDATE_AGENT_TRACE, SQL_GET_AGENT_TRACE,
     SQL_GET_TRACE_BY_MESSAGE, SQL_GET_ACTIVE_TRACE, SQL_CANCEL_ACTIVE_TRACES,
@@ -289,6 +290,45 @@ class ChatRequestContext:
     # `content` is stored/titled; the playbook body is injected only into `history`.
     playbook_name: Optional[str] = None
     playbook_id: Optional[int] = None
+
+
+def _pooled_playbook_service(pg_config) -> PlaybookService:
+    """PlaybookService on the process-wide pooled factory when available.
+
+    The agent path initializes PostgresServiceFactory at startup; reusing it
+    avoids a fresh TCP connection per call. Falls back to direct connections
+    when no factory exists (e.g. non-agent pipelines). Shared by ChatWrapper
+    (chat-flow turn tracking) and FlaskAppWrapper (REST + staging) so neither
+    class can lose the accessor again.
+    """
+    try:
+        from src.utils.postgres_service_factory import PostgresServiceFactory
+        factory = PostgresServiceFactory.get_instance()
+        if factory is not None:
+            return factory.playbook_service
+    except Exception as exc:
+        logger.debug("Pooled PlaybookService unavailable, using direct connections: %s", exc)
+    return PlaybookService(pg_config=pg_config)
+
+
+def _query_convo_history_rows(cursor, conversation_id):
+    """History rows (sender, content, message_id, feedback, comment_count,
+    model_used, playbook_name) for one conversation.
+
+    Falls back to the no-playbooks variant when conversation_playbook_turns is
+    missing (failed boot migration): chips degrade to absent instead of every
+    conversation load returning 500.
+    """
+    try:
+        cursor.execute(SQL_QUERY_CONVO_WITH_FEEDBACK, (conversation_id,))
+    except psycopg2.errors.UndefinedTable:
+        cursor.connection.rollback()  # leave the aborted transaction before retrying
+        logger.warning(
+            "conversation_playbook_turns missing; loading conversation %s without playbook chips",
+            conversation_id,
+        )
+        cursor.execute(SQL_QUERY_CONVO_WITH_FEEDBACK_NO_PLAYBOOKS, (conversation_id,))
+    return cursor.fetchall()
 
 
 class ChatWrapper:
@@ -1165,6 +1205,41 @@ class ChatWrapper:
 
         return context
 
+    def _playbook_svc(self) -> PlaybookService:
+        """Playbook service for chat-flow turn tracking (pooled when possible).
+
+        Regression guard: the chat flow calls this on ChatWrapper — it must
+        exist HERE, not only on FlaskAppWrapper (review run 3, finding 1).
+        """
+        return _pooled_playbook_service(self.pg_config)
+
+    def _insert_conversation_rows(self, insert_tups) -> List[int]:
+        """execute_values SQL_INSERT_CONVO rows and return the new message_ids
+        (one per row, in order). Shared by the normal and A/B store paths so
+        the insert + id-extraction logic cannot drift between them."""
+        # use local vars for thread safety; close even if the insert raises
+        conn = psycopg2.connect(**self.pg_config)
+        try:
+            cursor = conn.cursor()
+            psycopg2.extras.execute_values(cursor, SQL_INSERT_CONVO, insert_tups)
+            conn.commit()
+            message_ids = [row[0] for row in cursor.fetchall()]
+            cursor.close()
+        finally:
+            conn.close()
+        return message_ids
+
+    def _record_playbook_turn_best_effort(self, message_id, context) -> None:
+        """Side-table write for a /name turn — must never break the message
+        insert itself (the service raises; a missing side table degrades)."""
+        if not (message_id and context.playbook_name):
+            return
+        try:
+            self._playbook_svc().record_playbook_turn(
+                message_id, context.playbook_name, context.playbook_id)
+        except Exception as exc:
+            logger.warning("Could not record playbook turn for message %s: %s", message_id, exc)
+
     def insert_conversation(self, conversation_id, user_message, archi_message, link, archi_context, context:ChatRequestContext, is_refresh=False) -> List[int]:
         """
         """
@@ -1199,25 +1274,11 @@ class ChatWrapper:
             ]
         )
 
-        # create connection to database (use local vars for thread safety)
-        conn = psycopg2.connect(**self.pg_config)
-        cursor = conn.cursor()
-        psycopg2.extras.execute_values(cursor, SQL_INSERT_CONVO, insert_tups)
-        conn.commit()
-        message_ids = list(map(lambda tup: tup[0], cursor.fetchall()))
+        message_ids = self._insert_conversation_rows(insert_tups)
 
-        # clean up database connection state
-        cursor.close()
-        conn.close()
-
-        if not is_refresh and context.playbook_name and message_ids:
-            try:
-                self._playbook_svc().record_playbook_turn(
-                    message_ids[0], context.playbook_name, context.playbook_id)
-            except Exception as exc:
-                # A missing side table (failed migration) must never break the
-                # conversation insert itself.
-                logger.warning("Could not record playbook turn for message %s: %s", message_ids[0], exc)
+        if not is_refresh:
+            self._record_playbook_turn_best_effort(
+                message_ids[0] if message_ids else None, context)
 
         return message_ids
 
@@ -1527,8 +1588,7 @@ class ChatWrapper:
                     owner = get_playbook_owner()
                     if owner:
                         try:
-                            playbook_service = PlaybookService(pg_config=self.pg_config)
-                            playbook = playbook_service.resolve_invokable_playbook(
+                            playbook = self._playbook_svc().resolve_invokable_playbook(
                                 owner, stored_name
                             )
                             body = playbook.body
@@ -1878,24 +1938,13 @@ class ChatWrapper:
         user_prompt_mid = None
         if not is_refresh:
             try:
-                conn = psycopg2.connect(**self.pg_config)
-                cursor = conn.cursor()
                 insert_tups = [
                     ("chat", context.conversation_id, context.sender, context.content,
                      "", "", datetime.now(), None, None),
                 ]
-                psycopg2.extras.execute_values(cursor, SQL_INSERT_CONVO, insert_tups)
-                row = cursor.fetchone()
-                user_prompt_mid = row[0] if row else None
-                conn.commit()
-                cursor.close()
-                conn.close()
-                if context.playbook_name and user_prompt_mid:
-                    try:
-                        self._playbook_svc().record_playbook_turn(
-                            user_prompt_mid, context.playbook_name, context.playbook_id)
-                    except Exception as exc:
-                        logger.warning("Could not record playbook turn for message %s: %s", user_prompt_mid, exc)
+                inserted_ids = self._insert_conversation_rows(insert_tups)
+                user_prompt_mid = inserted_ids[0] if inserted_ids else None
+                self._record_playbook_turn_best_effort(user_prompt_mid, context)
             except Exception as exc:
                 logger.error("Failed to store user message: %s", exc)
 
@@ -1965,18 +2014,10 @@ class ChatWrapper:
     def _store_assistant_message(self, conversation_id, content, model_used=None, pipeline_used=None):
         """Store an assistant message and return the message_id."""
         try:
-            conn = psycopg2.connect(**self.pg_config)
-            cursor = conn.cursor()
-            insert_tups = [
+            inserted_ids = self._insert_conversation_rows([
                 ("chat", conversation_id, "archi", content, "", "", datetime.now(), model_used, pipeline_used),
-            ]
-            psycopg2.extras.execute_values(cursor, SQL_INSERT_CONVO, insert_tups)
-            row = cursor.fetchone()
-            mid = row[0] if row else None
-            conn.commit()
-            cursor.close()
-            conn.close()
-            return mid
+            ])
+            return inserted_ids[0] if inserted_ids else None
         except Exception as exc:
             logger.error("Failed to store assistant message: %s", exc)
             return None
@@ -4217,20 +4258,8 @@ class FlaskAppWrapper(object):
         return owner, None
 
     def _playbook_svc(self) -> PlaybookService:
-        """PlaybookService on the process-wide pooled factory when available.
-
-        The agent path initializes PostgresServiceFactory at startup; reusing it
-        avoids a fresh TCP connection per /api/playbooks request. Falls back to
-        direct connections when no factory exists (e.g. non-agent pipelines).
-        """
-        try:
-            from src.utils.postgres_service_factory import PostgresServiceFactory
-            factory = PostgresServiceFactory.get_instance()
-            if factory is not None:
-                return factory.playbook_service
-        except Exception as exc:
-            logger.debug("Pooled PlaybookService unavailable, using direct connections: %s", exc)
-        return PlaybookService(pg_config=self.pg_config)
+        """PlaybookService for the REST/staging paths (pooled when possible)."""
+        return _pooled_playbook_service(self.pg_config)
 
     def _stage_playbook_for_request(self, client_id, playbook_name) -> None:
         """Stage playbook state for a chat request via per-request ContextVars.
@@ -5103,6 +5132,7 @@ class FlaskAppWrapper(object):
         Returns:
             JSON with conversation metadata and full message history
         """
+        conn = None
         try:
             data = request.json
             conversation_id = data.get('conversation_id')
@@ -5132,8 +5162,8 @@ class FlaskAppWrapper(object):
                 return jsonify({'error': 'conversation not found'}), 404
 
             # get history of the conversation along with latest feedback state
-            cursor.execute(SQL_QUERY_CONVO_WITH_FEEDBACK, (conversation_id, ))
-            history_rows = cursor.fetchall()
+            # (degrades to chip-less rows if the side-table migration failed)
+            history_rows = _query_convo_history_rows(cursor, conversation_id)
             comparisons = self.chat.conv_service.get_conversation_ab_comparisons(str(conversation_id))
             suppressed_ids = self.chat._suppressed_ab_message_ids(comparisons)
             if suppressed_ids:
@@ -5205,6 +5235,10 @@ class FlaskAppWrapper(object):
         except Exception as e:
             logger.error(f"Error in load_conversation: {str(e)}")
             return jsonify({'error': str(e)}), 500
+        finally:
+            # never leak the connection, whichever path returned
+            if conn is not None and not conn.closed:
+                conn.close()
 
     def new_conversation(self):
         """

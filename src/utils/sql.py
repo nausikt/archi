@@ -69,6 +69,40 @@ WHERE c.conversation_id = %s
 ORDER BY c.message_id ASC;
 """
 
+# Fallback for deployments where the conversation_playbook_turns migration
+# failed (PlaybookService.ensure_schema is warn-and-continue at boot): same
+# column shape as SQL_QUERY_CONVO_WITH_FEEDBACK — playbook_name last, NULL —
+# so conversation loads degrade to chip-less instead of erroring. Keep the
+# SELECT lists of the two queries in sync.
+SQL_QUERY_CONVO_WITH_FEEDBACK_NO_PLAYBOOKS = """
+SELECT c.sender,
+       c.content,
+       c.message_id,
+       lf.feedback,
+       COALESCE(cf.comment_count, 0) AS comment_count,
+       c.model_used,
+       NULL AS playbook_name
+FROM conversations c
+LEFT JOIN (
+    SELECT DISTINCT ON (mid)
+        mid,
+        feedback,
+        feedback_ts
+    FROM feedback
+    WHERE feedback IN ('like', 'dislike')
+    ORDER BY mid, feedback_ts DESC
+) lf ON lf.mid = c.message_id
+LEFT JOIN (
+    SELECT mid,
+           COUNT(*) AS comment_count
+    FROM feedback
+    WHERE feedback = 'comment'
+    GROUP BY mid
+) cf ON cf.mid = c.message_id
+WHERE c.conversation_id = %s
+ORDER BY c.message_id ASC;
+"""
+
 SQL_INSERT_TIMING = """
 INSERT INTO timing (
     mid,

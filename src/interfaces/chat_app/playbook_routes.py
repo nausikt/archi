@@ -12,7 +12,7 @@ import posixpath
 import zipfile
 from datetime import datetime
 
-from flask import Blueprint, Response, jsonify, request
+from flask import Blueprint, Response, current_app, jsonify, request
 
 from src.utils.logging import get_logger
 from src.utils.playbook_service import (
@@ -30,11 +30,55 @@ logger = get_logger(__name__)
 playbooks_bp = Blueprint('playbooks', __name__)
 
 # ---------------------------------------------------------------------------
-# Module-level references injected at registration time
+# Per-app wiring, injected at registration time. Lives on app.config (read via
+# current_app) rather than module globals: a second FlaskAppWrapper in the same
+# process must not repoint the first app's already-registered routes, and
+# blueprint setup methods cannot be re-run after the first registration anyway
+# (flask forbids it).
 # ---------------------------------------------------------------------------
-_auth_enabled: bool = False
-_resolve_owner = None   # callable(request_client_id) -> (owner_id, error_response)
-_playbook_svc = None    # callable() -> PlaybookService
+_STATE_KEY = "PLAYBOOKS_BLUEPRINT_STATE"
+
+
+def _state():
+    return current_app.config[_STATE_KEY]
+
+
+def _resolve_owner(request_client_id):
+    """callable(request_client_id) -> (owner_id, error_response), per app."""
+    return _state()["resolve_owner"](request_client_id)
+
+
+def _playbook_svc():
+    """callable() -> PlaybookService, per app."""
+    return _state()["playbook_svc"]()
+
+
+def _auth_enabled() -> bool:
+    """Whether auth is enabled for THIS app (gates owner-identity exposure)."""
+    return _state()["auth_enabled"]
+
+
+@playbooks_bp.before_request
+def _check_auth():
+    """Apply the same auth gate used by the rest of the app.
+
+    require_auth is a decorator that wraps a view; we use a no-op probe
+    function so the auth logic (session check, SSO redirect, 401) fires
+    and we can intercept a non-passthrough result. Declared at module level
+    (not inside register_playbooks) so registering a second app never calls
+    a blueprint setup method after the first registration.
+    """
+    sentinel = object()
+    require_auth = _state()["require_auth"]
+
+    @require_auth
+    def _probe():
+        return sentinel
+
+    result = _probe()
+    if result is not sentinel:
+        return result  # redirect / 401 from require_auth
+
 
 # Upload cap: 100 playbooks * 16KB bodies plus zip overhead fits comfortably.
 _MAX_PLAYBOOK_UPLOAD_BYTES = 8 * 1024 * 1024
@@ -52,7 +96,7 @@ def list_playbooks():
         svc = _playbook_svc()
         enabled_ids = svc.list_enabled_playbook_ids(owner_id)
         items = []
-        for s in svc.list_playbooks(owner_id):
+        for s in svc.list_playbooks(owner_id, with_bodies=False):
             item = {
                 "id": s.id, "name": s.name, "description": s.description,
                 "visibility": s.visibility, "is_mine": s.owner_id == owner_id,
@@ -60,7 +104,7 @@ def list_playbooks():
             }
             # Owner identity is exposed only when auth verifies identities — in
             # anonymous mode an owner id IS the credential and must not leak.
-            if _auth_enabled and s.owner_id != owner_id:
+            if _auth_enabled() and s.owner_id != owner_id:
                 item["owner"] = s.owner_id
             items.append(item)
         return jsonify({"playbooks": items}), 200
@@ -83,7 +127,7 @@ def get_playbook(playbook_id):
             "description": s.description, "body": s.body,
             "visibility": s.visibility, "is_mine": s.owner_id == owner_id,
         }
-        if _auth_enabled and s.owner_id != owner_id:
+        if _auth_enabled() and s.owner_id != owner_id:
             payload["owner"] = s.owner_id
         return jsonify(payload), 200
     except PlaybookNotFoundError:
@@ -97,7 +141,9 @@ def get_playbook(playbook_id):
 def enable_playbook(playbook_id):
     """Add a public playbook to the caller's list (opt-in)."""
     try:
-        body = request.get_json(silent=True) or {}
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            body = {}  # same guard as delete: client_id may come from args instead
         owner_id, _err = _resolve_owner(
             body.get("client_id") or request.args.get("client_id")
         )
@@ -118,7 +164,9 @@ def enable_playbook(playbook_id):
 def disable_playbook(playbook_id):
     """Remove a public playbook from the caller's list (opt-out)."""
     try:
-        body = request.get_json(silent=True) or {}
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            body = {}  # same guard as delete: client_id may come from args instead
         owner_id, _err = _resolve_owner(
             body.get("client_id") or request.args.get("client_id")
         )
@@ -420,26 +468,11 @@ def register_playbooks(app, *, auth_enabled, require_auth, resolve_owner, playbo
         ``FlaskAppWrapper._playbook_svc`` — returns a PlaybookService on the
         pooled factory when available.
     """
-    global _auth_enabled, _resolve_owner, _playbook_svc
-    _auth_enabled = auth_enabled
-    _resolve_owner = resolve_owner
-    _playbook_svc = playbook_svc
-
-    @playbooks_bp.before_request
-    def _check_auth():
-        """Apply the same auth gate used by the rest of the app."""
-        # require_auth is a decorator that wraps a view; we use a no-op probe
-        # function so the auth logic (session check, SSO redirect, 401) fires
-        # and we can intercept a non-passthrough result.
-        sentinel = object()
-
-        @require_auth
-        def _probe():
-            return sentinel
-
-        result = _probe()
-        if result is not sentinel:
-            return result  # redirect / 401 from require_auth
-
+    app.config[_STATE_KEY] = {
+        "auth_enabled": auth_enabled,
+        "require_auth": require_auth,
+        "resolve_owner": resolve_owner,
+        "playbook_svc": playbook_svc,
+    }
     app.register_blueprint(playbooks_bp)
     logger.info("Registered playbooks blueprint at /api/playbooks")

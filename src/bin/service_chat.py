@@ -34,7 +34,11 @@ def main():
     try:
         factory.playbook_service.ensure_schema()
     except Exception as exc:
-        logger.warning("Could not ensure playbook schema: %s", exc)
+        logger.error(
+            "Could not ensure playbook schema — playbook features will degrade "
+            "(no turn tracking, chip-less conversation loads) until it succeeds: %s",
+            exc,
+        )
 
     # Reload config from Postgres (runtime source of truth)
     config = get_full_config()

@@ -1022,14 +1022,7 @@ const UI = {
     document.querySelector('.playbooks-new')?.addEventListener('click', () => {
       Chat._editingPlaybookId = null;
       Chat.setPlaybookEditorReadOnly(false);
-      ['#playbook-name', '#playbook-description', '#playbook-body'].forEach(sel => {
-        const el = document.querySelector(sel);
-        if (el) el.value = '';
-      });
-      const vis = document.querySelector('#playbook-visibility');
-      if (vis) vis.value = 'private';
-      const status = document.querySelector('#playbooks-status');
-      if (status) status.textContent = '';
+      Chat.setPlaybookEditorFields();  // empty fields, visibility back to private
       Chat.showPlaybooksView('editor', 'New playbook');
     });
     document.querySelector('.playbooks-export')?.addEventListener('click', async () => {
@@ -1110,12 +1103,7 @@ const UI = {
         try {
           const playbook = await API.getPlaybook((editBtn || viewBtn).dataset.id);
           Chat._editingPlaybookId = editBtn ? playbook.id : null;
-          document.querySelector('#playbook-name').value = playbook.name;
-          document.querySelector('#playbook-description').value = playbook.description;
-          document.querySelector('#playbook-visibility').value = playbook.visibility || 'private';
-          document.querySelector('#playbook-body').value = playbook.body;
-          const status = document.querySelector('#playbooks-status');
-          if (status) status.textContent = '';
+          Chat.setPlaybookEditorFields(playbook);
           Chat.setPlaybookEditorReadOnly(!editBtn);  // View = read-only
           Chat.showPlaybooksView('editor', editBtn ? 'Edit playbook' : playbook.name);
         } catch (err) {
@@ -5467,9 +5455,29 @@ const Chat = {
     }
   },
 
+  // The editor's input fields, keyed by selector — the single source used to
+  // populate, reset and (un)lock them, so the call sites cannot drift.
+  playbookEditorFields: {
+    '#playbook-name': 'name',
+    '#playbook-description': 'description',
+    '#playbook-visibility': 'visibility',
+    '#playbook-body': 'body',
+  },
+
+  setPlaybookEditorFields(playbook = {}) {
+    Object.entries(this.playbookEditorFields).forEach(([sel, field]) => {
+      const el = document.querySelector(sel);
+      if (!el) return;
+      if (field === 'visibility') el.value = playbook.visibility || 'private';
+      else el.value = playbook[field] || '';
+    });
+    const status = document.querySelector('#playbooks-status');
+    if (status) status.textContent = '';
+  },
+
   setPlaybookEditorReadOnly(readOnly) {
     this._playbookEditorReadOnly = !!readOnly;
-    ['#playbook-name', '#playbook-description', '#playbook-visibility', '#playbook-body'].forEach(sel => {
+    Object.keys(this.playbookEditorFields).forEach(sel => {
       const el = document.querySelector(sel);
       if (el) el.disabled = this._playbookEditorReadOnly;
     });

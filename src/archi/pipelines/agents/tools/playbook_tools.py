@@ -131,6 +131,24 @@ def _safe_catalog(service: PlaybookService, owner: str) -> str:
         return "(could not list playbooks)"
 
 
+def _resolve_owned_playbook(service, owner, name: str, foreign_refusal: str):
+    """The caller's own playbook by `name`, or (None, message) when it cannot
+    be edited: `foreign_refusal` for a public playbook owned by someone else,
+    otherwise a not-found message listing the available names. Shared by the
+    update and delete tools so the fallback ladder cannot drift between them.
+    """
+    try:
+        return service.get_playbook_by_name(owner, name), None
+    except PlaybookNotFoundError:
+        try:
+            shared = service.get_playbook_by_name(owner, name, include_public=True)
+            if shared.owner_id != owner:
+                return None, foreign_refusal
+        except PlaybookNotFoundError:
+            pass
+        return None, f"No playbook named '{name}'. Available playbooks:\n{_safe_catalog(service, owner)}"
+
+
 def format_playbook_listing(service: PlaybookService, owner: str) -> Optional[str]:
     """The always-in-context playbook listing (Claude Code's Level 1 metadata block).
 
@@ -391,19 +409,13 @@ def create_update_playbook_tool(
         if (new_name is None and description is None and body is None and append_body is None
                 and visibility is None):
             return "Nothing to update — pass new_name, description, body, append_body, or visibility."
-        try:
-            playbook = service.get_playbook_by_name(owner, name)
-        except PlaybookNotFoundError:
-            try:
-                shared = service.get_playbook_by_name(owner, name, include_public=True)
-                if shared.owner_id != owner:
-                    return (
-                        f"'{name}' is a public playbook owned by someone else — you can only modify "
-                        "your own playbooks. Save your own copy under a different name instead."
-                    )
-            except PlaybookNotFoundError:
-                pass
-            return f"No playbook named '{name}'. Available playbooks:\n{_safe_catalog(service, owner)}"
+        playbook, err = _resolve_owned_playbook(
+            service, owner, name,
+            f"'{name}' is a public playbook owned by someone else — you can only modify "
+            "your own playbooks. Save your own copy under a different name instead.",
+        )
+        if err:
+            return err
         new_body = body
         if append_body is not None:
             new_body = f"{playbook.body}\n{append_body}"
@@ -450,19 +462,13 @@ def create_delete_playbook_tool(
         owner = get_owner()
         if service is None or not owner:
             return "Playbooks are unavailable in this session."
-        try:
-            playbook = service.get_playbook_by_name(owner, name)
-        except PlaybookNotFoundError:
-            try:
-                shared = service.get_playbook_by_name(owner, name, include_public=True)
-                if shared.owner_id != owner:
-                    return (
-                        f"'{name}' is a public playbook owned by someone else — only its owner can "
-                        "delete it."
-                    )
-            except PlaybookNotFoundError:
-                pass
-            return f"No playbook named '{name}'. Available playbooks:\n{_safe_catalog(service, owner)}"
+        playbook, err = _resolve_owned_playbook(
+            service, owner, name,
+            f"'{name}' is a public playbook owned by someone else — only its owner can "
+            "delete it.",
+        )
+        if err:
+            return err
         if not confirmed:
             # Surface the question to the user and STOP — do not chain a confirmed call yourself.
             return (

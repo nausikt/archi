@@ -19,6 +19,46 @@ class SupportsPlaybooks:
     always-in-context listing). Mix in BEFORE BaseReActAgent. Agents that don't inherit
     this carry no playbook code and open no PlaybookService connection."""
 
+    # The hooks this mixin contributes to via cooperative super() chaining. A base
+    # agent's implementations are terminal, so any non-mixin class positioned before
+    # SupportsPlaybooks in the MRO that defines one of these WITHOUT chaining would
+    # swallow the whole feature — silently (its __init__ would not even run).
+    _COOPERATIVE_HOOKS = ("_tool_definitions", "_build_static_tools", "_build_static_middleware")
+
+    @staticmethod
+    def _is_terminal_hook(func) -> bool:
+        """True when a hook implementation ends the builder chain.
+
+        A cooperative hook calls super(), which shows up as the name ``super``
+        in its code object; a terminal one (e.g. BaseReActAgent's builders)
+        never does. Anything we cannot introspect is treated as cooperative —
+        the guard must never reject a valid composition, only the provably
+        chain-breaking one.
+        """
+        code = getattr(func, "__code__", None)
+        return code is not None and "super" not in code.co_names
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        super().__init_subclass__(**kwargs)
+        mro = cls.__mro__
+        mixin_idx = mro.index(SupportsPlaybooks)
+        shadower = next(
+            (c for c in mro[:mixin_idx]
+             if not issubclass(c, SupportsPlaybooks)
+             and any(hook in vars(c)
+                     and SupportsPlaybooks._is_terminal_hook(vars(c)[hook])
+                     for hook in SupportsPlaybooks._COOPERATIVE_HOOKS)),
+            None,
+        )
+        if shadower is not None:
+            raise TypeError(
+                f"{cls.__name__}: SupportsPlaybooks must come BEFORE "
+                f"{shadower.__name__} in the class bases — declare "
+                f"`class {cls.__name__}(SupportsPlaybooks, {shadower.__name__})`. "
+                f"As written, {shadower.__name__}'s builder methods terminate the "
+                "chain and every playbook tool would be silently dropped."
+            )
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._playbook_service = self._init_playbook_service()

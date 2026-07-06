@@ -871,6 +871,30 @@ class TestPlaybookService:
         assert "part two" in parsed["description"]
         assert parsed["body"] == "BODY"
 
+    def test_parse_playbook_md_non_string_name_is_rejected_not_renamed(self):
+        """YAML 1.1 'Norway problem': unquoted no/off/false parse as bool and 0
+        as int — all four are valid slugs, and the old truthiness fallback
+        silently imported the playbook under the folder/file name (and
+        overwrite-on-conflict then targeted the wrong entry). A non-string
+        name must be a loud per-item error telling the user to quote it."""
+        from src.utils.playbook_service import parse_playbook_md
+        for literal in ("no", "off", "false", "0"):
+            md = f"---\nname: {literal}\ndescription: d\n---\nBODY"
+            with pytest.raises(PlaybookValidationError, match="quote"):
+                parse_playbook_md(md, fallback_name="from-folder")
+
+    def test_parse_playbook_md_quoted_reserved_word_name_is_kept(self):
+        from src.utils.playbook_service import parse_playbook_md
+        md = '---\nname: "no"\ndescription: d\n---\nBODY'
+        assert parse_playbook_md(md, fallback_name="from-folder")["name"] == "no"
+
+    def test_parse_playbook_md_non_string_description_is_rejected(self):
+        """Same coercion on description would silently store 'False'."""
+        from src.utils.playbook_service import parse_playbook_md
+        md = "---\nname: a\ndescription: off\n---\nBODY"
+        with pytest.raises(PlaybookValidationError, match="quote"):
+            parse_playbook_md(md)
+
     def test_pending_playbook_contextvar_roundtrip(self):
         from src.archi.pipelines.agents.tools.playbook_tools import (
             set_pending_playbook, get_pending_playbook, clear_pending_playbook,
@@ -1160,6 +1184,25 @@ class TestResolvePlaybookOwner:
         assert owner is None
         assert "NUL" in err
 
+    def test_anon_non_string_client_id_returns_error(self):
+        """A non-string client_id (any JSON type) → rejectable error, never an
+        unhandled exception.
+
+        A dict slips past the truthiness and NUL guards ('\\x00' in a dict
+        checks keys) and psycopg2 cannot adapt it at bind time; an int makes
+        the NUL membership test itself raise TypeError. Both must become a
+        clean 400-path error instead of a blanket 500.
+        """
+        for bad_client_id in ({"x": 1}, 123, ["c1"], True):
+            owner, err = resolve_playbook_owner(
+                auth_enabled=False,
+                logged_in=False,
+                session_user=None,
+                request_client_id=bad_client_id,
+            )
+            assert owner is None, f"owner must not be {bad_client_id!r}"
+            assert "string" in err
+
     def test_authed_not_logged_in_no_client_id_returns_error(self):
         """Auth enabled, not logged in, no client_id supplied → rejectable error."""
         owner, err = resolve_playbook_owner(
@@ -1267,6 +1310,22 @@ def test_load_query_reads_playbook_from_side_table():
     assert "conversation_playbook_turns cpt" in sql.SQL_QUERY_CONVO_WITH_FEEDBACK
     assert "cpt.playbook_name" in sql.SQL_QUERY_CONVO_WITH_FEEDBACK
     assert "c.playbook_name" not in sql.SQL_QUERY_CONVO_WITH_FEEDBACK
+
+
+def test_load_query_fallback_variant_omits_side_table():
+    """M1 guard: when the side-table migration failed, conversation loads fall
+    back to this variant — it must not touch conversation_playbook_turns and
+    must keep the exact column shape of the primary query (playbook_name last,
+    NULL) so the row-unpacking code works unchanged."""
+    from src.utils import sql
+    fallback = sql.SQL_QUERY_CONVO_WITH_FEEDBACK_NO_PLAYBOOKS
+    assert "conversation_playbook_turns" not in fallback
+    assert "NULL AS playbook_name" in fallback
+    for shared_expr in ("c.sender", "c.content", "c.message_id",
+                        "lf.feedback", "comment_count", "c.model_used"):
+        assert shared_expr in fallback
+    assert "WHERE c.conversation_id = %s" in fallback
+    assert "ORDER BY c.message_id ASC" in fallback
 
 
 def test_side_table_access_lives_on_playbook_service_not_app():

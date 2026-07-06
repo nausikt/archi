@@ -478,6 +478,10 @@ class PlaybookService:
                 cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_playbooks_owner ON playbooks(owner_id)"
                 )
+                # NOT dead code: migrates playbooks tables created by pre-visibility
+                # dev-era builds of this branch (the CREATE above already declares the
+                # column for fresh installs, and `main` never shipped playbooks).
+                # Removable once every long-lived dev DB has booted a build >= this one.
                 cursor.execute(
                     "ALTER TABLE playbooks "
                     "ADD COLUMN IF NOT EXISTS visibility VARCHAR(10) NOT NULL DEFAULT 'private'"
@@ -594,6 +598,12 @@ def resolve_playbook_owner(auth_enabled, logged_in, session_user, request_client
         return None, "no verified identity for the authenticated session"
     if not request_client_id:
         return None, "client_id is required"
+    # client_id arrives from a JSON body and may be any JSON type: a dict slips
+    # past the truthiness and NUL guards, an int makes the NUL check raise.
+    # Reject non-strings at this chokepoint so every endpoint returns a clean
+    # 400 instead of a psycopg2 adapt error (500).
+    if not isinstance(request_client_id, str):
+        return None, "client_id must be a string"
     # A NUL (0x00) cannot be a Postgres string parameter; reject it at this chokepoint so a
     # malformed client_id surfaces as a clean 400 on every endpoint rather than an unhandled
     # psycopg2 error (500) once it is used as owner_id.
@@ -698,11 +708,28 @@ def parse_playbook_md(text: str, fallback_name: str = "") -> Dict[str, str]:
         raise PlaybookValidationError(f"SKILL.md frontmatter is not valid YAML: {exc}") from exc
     if not isinstance(front, dict):
         raise PlaybookValidationError("SKILL.md frontmatter must be a YAML mapping")
+
+    def _front_str(key: str):
+        value = front.get(key)
+        if value is None or isinstance(value, str):
+            return value
+        # YAML 1.1 coerces unquoted no/off/false/yes/on/true to bool and bare
+        # digits to numbers (the "Norway problem"); a truthiness fallback here
+        # silently renamed the playbook to its folder/file name. Make the user
+        # quote the value instead of guessing what they meant.
+        raise PlaybookValidationError(
+            f"SKILL.md frontmatter '{key}' must be a string — quote YAML-reserved "
+            f"values like 'no', 'off', 'false' or bare numbers (got {value!r})"
+        )
+
     metadata = front.get("metadata") if isinstance(front.get("metadata"), dict) else {}
     visibility = metadata.get("visibility") or front.get("visibility")
     return {
-        "name": str(front.get("name") or fallback_name or "").strip(),
-        "description": str(front.get("description") or "").strip(),
+        # absent (or empty) name still falls back to the folder/file name;
+        # visibility stays truthiness-based: only the exact string "public"
+        # publishes, so a coerced bool can never accidentally share.
+        "name": str(_front_str("name") or fallback_name or "").strip(),
+        "description": str(_front_str("description") or "").strip(),
         "body": "\n".join(lines[idx:]).strip(),
         "visibility": "public" if visibility == "public" else "private",
     }

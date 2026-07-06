@@ -412,6 +412,44 @@ def test_base_agent_has_no_playbook_tools():
     assert not hasattr(a, "_init_playbook_service")
 
 
+def test_mixin_declared_after_base_agent_raises_at_class_definition():
+    """SupportsPlaybooks contributes tools/middleware only via cooperative
+    super() chaining, and BaseReActAgent's builders are terminal: declaring
+    the mixin AFTER the base silently dropped the entire feature (no crash,
+    no log). That mistake must fail loudly when the class is defined."""
+    from src.archi.pipelines.agents.base_react import BaseReActAgent
+    from src.archi.pipelines.agents.playbook_mixin import SupportsPlaybooks
+
+    with pytest.raises(TypeError, match="SupportsPlaybooks"):
+        class _WrongOrder(BaseReActAgent, SupportsPlaybooks):
+            pass
+
+
+def test_mixin_declared_before_base_agent_is_accepted():
+    from src.archi.pipelines.agents.base_react import BaseReActAgent
+    from src.archi.pipelines.agents.playbook_mixin import SupportsPlaybooks
+
+    class _RightOrder(SupportsPlaybooks, BaseReActAgent):  # noqa: F841
+        pass  # must not raise — this is the documented order
+
+
+def test_cooperative_mixin_before_supports_playbooks_is_accepted():
+    """A cooperative capability mixin (its hooks call super()) placed BEFORE
+    SupportsPlaybooks is a valid composition — the chain runs CoopMixin →
+    SupportsPlaybooks → BaseReActAgent and nothing is dropped. The order guard
+    must only reject TERMINAL shadowers (hooks that do not chain), not every
+    class that happens to define a hook earlier in the MRO."""
+    from src.archi.pipelines.agents.base_react import BaseReActAgent
+    from src.archi.pipelines.agents.playbook_mixin import SupportsPlaybooks
+
+    class _CoopToolsMixin:
+        def _build_static_tools(self):
+            return list(super()._build_static_tools()) + ["coop-tool"]
+
+    class _Composed(_CoopToolsMixin, SupportsPlaybooks, BaseReActAgent):  # noqa: F841
+        pass  # must not raise — cooperative hooks chain through the mixin
+
+
 def test_agent_registers_playbook_authoring_tools():
     from src.archi.pipelines.agents.cms_comp_ops_agent import CMSCompOpsAgent
     agent = CMSCompOpsAgent.__new__(CMSCompOpsAgent)
