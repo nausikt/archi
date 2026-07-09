@@ -2839,6 +2839,10 @@ class FlaskAppWrapper(object):
             if self.sso_enabled:
                 self.add_endpoint('/redirect', 'sso_callback', self.sso_callback)
 
+            if self._forward_sso_enabled:
+                # Tie UI login lifetime to the SSO token-session lifetime.
+                self._register_sso_session_bridge()
+
     def _set_user_session(self, email: str, name: str, username: str, user_id: str = '', auth_method: str = 'sso', roles: list = None):
         """Set user session with well-defined structure."""
         session['user'] = {
@@ -3086,6 +3090,56 @@ class FlaskAppWrapper(object):
             )
             flash(f"Authentication failed: {str(e)}")
             return redirect(url_for('login'))
+
+    def _register_sso_session_bridge(self):
+        """Force re-auth when the SSO token session is gone.
+
+        When forward_sso is enabled and the browser is logged in via SSO with
+        an sso_sid, but the backing token session has expired/vanished, clear
+        the Flask login and bounce to /login (or 401 for APIs). Without this
+        the signed cookie keeps the user "logged in" while user-scoped MCP
+        tools silently stop working.
+        """
+        if not (self.auth_enabled and self.sso_enabled and self._forward_sso_enabled):
+            return
+
+        # Never enforce on these (avoid redirect loops / needless DB hits).
+        exempt_endpoints = {"login", "logout", "sso_callback", "static"}
+
+        @self.app.before_request
+        def _enforce_sso_session():
+            if request.method == "OPTIONS":
+                return None
+            if request.endpoint in exempt_endpoints:
+                return None
+            # Only SSO-cookie logins are gated; Bearer/API and basic-auth skip.
+            if not session.get("logged_in"):
+                return None
+            if session.get("auth_method") != "sso":
+                return None
+            sso_sid = session.get("sso_sid")
+            if not sso_sid:
+                return None
+
+            if self.token_service.session_alive(sso_sid):
+                return None
+
+            # Token session is gone -> force re-auth.
+            user_email = self._get_session_user_email()
+            session.clear()
+            log_authentication_event(
+                user=user_email or "unknown",
+                event_type="sso_session_expired",
+                success=False,
+                method="web",
+                details=f"path={request.path}",
+            )
+            if request.path.startswith("/api/"):
+                return jsonify({
+                    "error": "session_expired",
+                    "message": "Your SSO session expired. Please log in again.",
+                }), 401
+            return redirect(url_for("login"))
 
     def get_user(self):
         """API endpoint to get current user information including roles and permissions"""

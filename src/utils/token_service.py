@@ -239,6 +239,32 @@ class TokenService:
             refresher=refresher,
             early_refresh_seconds=early_refresh_seconds,
         )
+    
+    def session_alive(self, sso_sid: str) -> bool:
+        """Cheap check: is the SSO token-session window still open?
+
+        Unlike get_access_token this does no decryption and no refresh — it
+        only answers "does a non-expired row exist?". Used by the web layer to
+        tie the Flask login lifetime to the token-session lifetime without
+        incurring a refresh on every request.
+        """
+        if not self.enabled or not sso_sid:
+            return False
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM sessions WHERE id = %s AND expires_at > NOW()",
+                    (sso_sid,),
+                )
+                return cur.fetchone() is not None
+        except Exception as exc:
+            logger.warning(
+                "session_alive check failed for sid=%s...: %s", sso_sid[:8], exc
+            )
+            return True  # fail-open: don't mass-logout on a transient DB blip
+        finally:
+            self._release_connection(conn)
 
     # ------------------------------------------------------------------
     # Internals
