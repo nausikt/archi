@@ -1,10 +1,14 @@
 from unittest.mock import MagicMock
 
-from src.utils.playbook_service import Playbook, PlaybookNotFoundError, PlaybookConflictError, PlaybookValidationError
+from src.utils.playbook_service import (
+    Playbook, PlaybookNotFoundError, PlaybookConflictError, PlaybookValidationError,
+    playbook_invocation_text,
+)
 from src.archi.pipelines.agents.tools.playbook_tools import (
     create_playbook_tool, create_playbook_listing_middleware, format_playbook_listing,
     create_save_playbook_tool, create_update_playbook_tool, create_delete_playbook_tool,
     set_playbook_owner, get_playbook_owner,
+    set_pending_playbook, get_pending_playbook, clear_pending_playbook,
     PLAYBOOK_LISTING_PREAMBLE,
 )
 
@@ -233,7 +237,23 @@ def test_save_playbook_validation_error_is_reported():
     assert "Could not save" in out
 
 
-# ── agent wiring (base class generalization) ─────────────────────────────────────
+# ── agent wiring ─────────────────────────────────────────────────────────────────────
+
+
+def _mixin_agent():
+    from src.archi.pipelines.agents.base_react import BaseReActAgent
+    from src.archi.pipelines.agents.playbook_mixin import SupportsPlaybooks
+    class _PB(SupportsPlaybooks, BaseReActAgent):
+        pass
+    return _PB.__new__(_PB)
+
+
+def test_base_agent_has_no_playbook_tools():
+    from src.archi.pipelines.agents.base_react import BaseReActAgent
+    a = BaseReActAgent.__new__(BaseReActAgent)
+    assert a.get_tool_registry() == {}
+    assert not hasattr(a, "_init_playbook_service")
+
 
 def test_agent_registers_playbook_authoring_tools():
     from src.archi.pipelines.agents.cms_comp_ops_agent import CMSCompOpsAgent
@@ -246,19 +266,13 @@ def test_agent_registers_playbook_authoring_tools():
     assert {"save_playbook", "update_playbook", "delete_playbook"} <= set(reg)
 
 
-def test_base_agent_registers_playbook_tools_too():
-    # The generalization: ANY agent (not just CMS Comp Ops) gets the playbook tools.
-    from src.archi.pipelines.agents.base_react import BaseReActAgent
-    agent = BaseReActAgent.__new__(BaseReActAgent)
-    agent._playbook_service = MagicMock()
-    assert {"save_playbook", "update_playbook", "delete_playbook"} <= set(agent.get_tool_registry())
-
-
 def test_agent_without_service_keeps_registry_but_tools_degrade():
     # The registry must expose the authoring tools even with no PlaybookService
     # (agent specs reference them by name); the built tools then degrade politely.
-    from src.archi.pipelines.agents.base_react import BaseReActAgent
-    agent = BaseReActAgent.__new__(BaseReActAgent)
+    # get_tool_registry() lives on the concrete agent (base stays untouched), so
+    # exercise the real CMSCompOpsAgent rather than a bare mixin+base stand-in.
+    from src.archi.pipelines.agents.cms_comp_ops_agent import CMSCompOpsAgent
+    agent = CMSCompOpsAgent.__new__(CMSCompOpsAgent)
     agent._playbook_service = None
     reg = agent.get_tool_registry()
     assert {"save_playbook", "update_playbook", "delete_playbook"} <= set(reg)
@@ -266,24 +280,8 @@ def test_agent_without_service_keeps_registry_but_tools_degrade():
     assert "unavailable" in out.lower()
 
 
-def test_legacy_spec_tool_names_alias_to_playbook_tools():
-    # Interim builds shipped skill-named tools; specs written against them must
-    # keep working, and the removed list/load names are dropped (replaced by the
-    # ambient listing + the always-registered Playbook tool). Listing both the
-    # alias and the real name yields one tool, not two.
-    from src.archi.pipelines.agents.base_react import BaseReActAgent
-    agent = BaseReActAgent.__new__(BaseReActAgent)
-    agent._playbook_service = MagicMock()
-    tools = agent._select_tools_from_registry(
-        ["save_skill", "save_playbook", "update_skill", "delete_skill",
-         "list_playbooks", "load_playbook"])
-    names = [t.name for t in tools]
-    assert sorted(names) == ["delete_playbook", "save_playbook", "update_playbook"]
-
-
 def test_static_tools_include_playbook_tool():
-    from src.archi.pipelines.agents.base_react import BaseReActAgent
-    agent = BaseReActAgent.__new__(BaseReActAgent)
+    agent = _mixin_agent()
     agent._playbook_service = MagicMock()
     agent.selected_tool_names = []
     tools = agent._build_static_tools()
@@ -291,8 +289,7 @@ def test_static_tools_include_playbook_tool():
 
 
 def test_static_middleware_includes_listing_when_service_present():
-    from src.archi.pipelines.agents.base_react import BaseReActAgent
-    agent = BaseReActAgent.__new__(BaseReActAgent)
+    agent = _mixin_agent()
     agent._playbook_service = MagicMock()
     assert len(agent._build_static_middleware()) == 1
     agent._playbook_service = None
@@ -541,3 +538,384 @@ def test_save_playbook_description_carries_authoring_guidance():
     assert "ONLY call this when the user explicitly asks" in tool.description
     assert "## Output format" in tool.description
     assert "update_playbook" in tool.description
+
+
+def test_save_playbook_description_carries_writing_style_and_safety_guidance():
+    # The skill-creator writing-style clauses AND the safety refusal live ONLY in
+    # this tool description; trimming any would silently degrade how every agent
+    # authors — and the refusal is a multi-tenant guardrail (public playbooks land
+    # in other users' context). Pin the load-bearing phrases against a future trim.
+    tool = create_save_playbook_tool(None, lambda: None)
+    # Normalize whitespace so a phrase that wraps across lines still matches
+    # (and the test survives a future re-wrap of the docstring).
+    desc = " ".join(tool.description.split())
+    assert "reconstructed from THIS conversation" in desc   # capture intent from history
+    assert "future agent with no memory" in desc            # write for another Claude / non-obvious
+    assert "Generalize past the one example" in desc        # general, not example-narrow
+    assert "reread the body" in desc                         # self-review with fresh eyes
+    assert "Refuse to save" in desc and "exfiltration" in desc  # safety: no deceptive/abusive playbooks
+
+
+# ── pending_playbook ContextVar ─────────────────────────────────────────────────────────
+
+def test_pending_playbook_roundtrip_with_id():
+    # set_pending_playbook now stores playbook_id; get_pending_playbook must reflect it.
+    set_pending_playbook("my-plan", "the body", foreign=False, playbook_id=42)
+    p = get_pending_playbook()
+    assert p["name"] == "my-plan"
+    assert p["body"] == "the body"
+    assert p["foreign"] is False
+    assert p["playbook_id"] == 42
+
+
+def test_pending_playbook_default_id_is_none():
+    # When playbook_id is omitted (or not passed) it should default to None.
+    set_pending_playbook("other", "body")
+    p = get_pending_playbook()
+    assert p["playbook_id"] is None
+
+
+def test_clear_pending_playbook_resets_to_none():
+    set_pending_playbook("x", "y", playbook_id=7)
+    assert get_pending_playbook() is not None
+    clear_pending_playbook()
+    assert get_pending_playbook() is None
+
+
+def test_pending_playbook_foreign_flag_preserved():
+    set_pending_playbook("shared", "body", foreign=True, playbook_id=99)
+    p = get_pending_playbook()
+    assert p["foreign"] is True
+    assert p["playbook_id"] == 99
+
+
+# ── playbook_invocation_text ────────────────────────────────────────────────────────────
+
+def test_invocation_text_empty_body_returns_text_unchanged():
+    # If the body is empty, the function must return the original user text as-is.
+    assert playbook_invocation_text("some args", "foo", "") == "some args"
+
+
+def test_invocation_text_substitutes_all_arguments_occurrences():
+    # A body that contains $ARGUMENTS more than once → all occurrences in the body are replaced.
+    body = "Step 1: check $ARGUMENTS. Step 2: log $ARGUMENTS."
+    result = playbook_invocation_text("T2_US_MIT", "check", body)
+    assert "T2_US_MIT" in result
+    assert "$ARGUMENTS" not in result
+    # The body portion of the result (after the command block wrapper) must contain the
+    # substituted value twice — once per original $ARGUMENTS occurrence.
+    body_section = result.split("</command-args>")[-1]
+    assert body_section.count("T2_US_MIT") == 2
+
+
+def test_invocation_text_empty_args_substitutes_placeholder_with_empty():
+    # $ARGUMENTS present, but user text is empty/whitespace → placeholder is replaced
+    # with an empty string (the placeholder disappears, body is still expanded).
+    body = "Run for $ARGUMENTS"
+    result = playbook_invocation_text("", "run", body)
+    assert "<command-name>/run</command-name>" in result
+    # The literal $ARGUMENTS token must be gone.
+    assert "$ARGUMENTS" not in result
+    # The word "Run for " should appear in the expansion.
+    assert "Run for" in result
+
+
+def test_invocation_text_whitespace_only_args_uses_body_without_args():
+    # args that are whitespace-only: $ARGUMENTS in body → replaced with whitespace-only
+    # string; no-$ARGUMENTS path: whitespace-only text → body-only (not appended).
+    body_with = "check $ARGUMENTS now"
+    result_with = playbook_invocation_text("   ", "p", body_with)
+    assert "$ARGUMENTS" not in result_with
+
+    body_without = "fixed steps"
+    result_without = playbook_invocation_text("   ", "p", body_without)
+    # text is truthy (non-empty string), so ARGUMENTS: appended per the elif branch
+    assert "ARGUMENTS:" in result_without
+
+
+def test_invocation_text_no_placeholder_no_args_returns_body_only():
+    # No $ARGUMENTS in body, empty user text → content is just the body (no ARGUMENTS trailer).
+    body = "Just the fixed steps."
+    result = playbook_invocation_text("", "myfn", body)
+    assert "Just the fixed steps." in result
+    assert "ARGUMENTS:" not in result
+
+
+def test_invocation_text_foreign_fence_and_args_together():
+    # foreign=True: fence prefix appears; $ARGUMENTS substitution also applies.
+    body = "Shared guidance for $ARGUMENTS"
+    result = playbook_invocation_text("T2_DE_DESY", "shared", body, foreign=True)
+    assert "Public playbook shared by another user" in result
+    assert "T2_DE_DESY" in result
+    assert "$ARGUMENTS" not in result
+
+
+def test_invocation_text_contains_command_block_wrapper():
+    # The returned string always wraps with <command-message>, <command-name>, <command-args>
+    # regardless of substitution path.
+    result = playbook_invocation_text("my args", "the-name", "body text")
+    assert "<command-message>the-name is running…</command-message>" in result
+    assert "<command-name>/the-name</command-name>" in result
+    assert "<command-args>my args</command-args>" in result
+
+
+# ── playbook load tool — additional gap cases ────────────────────────────────────────────
+
+def test_playbook_tool_foreign_public_with_args_fences_and_substitutes():
+    # A foreign public playbook with $ARGUMENTS: both the fence prefix and the substitution
+    # must apply — the fencing check must happen after the arg substitution.
+    svc = MagicMock()
+    svc.get_playbook_by_name.return_value = Playbook(
+        id=5, name="shared", description="d",
+        body="Run $ARGUMENTS on grid", owner_id="other", visibility="public",
+    )
+    tool = create_playbook_tool(svc, _owner)
+    out = tool.invoke({"playbook": "shared", "args": "T2_US_MIT"})
+    assert "Public playbook shared by another user" in out
+    assert "T2_US_MIT" in out
+    assert "$ARGUMENTS" not in out
+
+
+def test_playbook_tool_not_found_lists_available_names_in_output():
+    # Already covered by test_playbook_tool_not_found_lists_available, but we also verify
+    # that the output contains the word "Available" and the catalog name.
+    svc = MagicMock()
+    svc.get_playbook_by_name.side_effect = PlaybookNotFoundError("x")
+    svc.list_playbooks.return_value = [
+        Playbook(id=1, name="rucio-check", description="desc", body="", owner_id="c1"),
+    ]
+    tool = create_playbook_tool(svc, _owner)
+    out = tool.invoke({"playbook": "unknown"})
+    assert "rucio-check" in out
+    assert "Available" in out or "available" in out
+
+
+def test_playbook_tool_no_owner_is_graceful_any_name():
+    # owner=None always returns the unavailable message — service can be a real mock.
+    svc = MagicMock()
+    tool = create_playbook_tool(svc, lambda: None)
+    out = tool.invoke({"playbook": "anything"})
+    assert "unavailable" in out.lower()
+    svc.get_playbook_by_name.assert_not_called()
+
+
+# ── listing — additional gap cases ──────────────────────────────────────────────────────
+
+def test_listing_many_long_descriptions_triggers_truncation_with_ellipsis():
+    # With many playbooks whose descriptions are very long, format_playbook_listing must
+    # truncate to stay under the budget and each truncated line must end with '…'.
+    svc = MagicMock()
+    svc.list_playbooks.return_value = [
+        Playbook(id=i, name=f"pb-{i}", description="a" * 500, body="", owner_id="c1")
+        for i in range(30)
+    ]
+    out = format_playbook_listing(svc, "c1")
+    assert out is not None
+    assert "…" in out
+    # Names must still be present even after truncation.
+    assert "pb-0" in out
+    assert "pb-29" in out
+
+
+def test_listing_public_marker_only_on_foreign_rows_not_own_public():
+    # The owner's own public playbook gets NO [public] marker.
+    # A foreign owner's public playbook DOES get it.
+    # This tests the invariant at the unit level (not just as a side-effect).
+    svc = MagicMock()
+    svc.list_playbooks.return_value = [
+        Playbook(id=1, name="my-public", description="d1", body="",
+                 owner_id="c1", visibility="public"),          # own — no marker
+        Playbook(id=2, name="their-public", description="d2", body="",
+                 owner_id="not-c1", visibility="public"),       # foreign — marker
+    ]
+    out = format_playbook_listing(svc, "c1")
+    assert "- my-public: d1" in out
+    assert "- my-public: d1 [public]" not in out
+    assert "- their-public: d2 [public]" in out
+
+
+def test_listing_empty_returns_none_idempotent():
+    # format_playbook_listing must return None (not an empty string or preamble-only)
+    # when there are no playbooks — the middleware relies on this to skip injection.
+    svc = MagicMock()
+    svc.list_playbooks.return_value = []
+    result = format_playbook_listing(svc, "c1")
+    assert result is None
+
+
+# ── mixin — with and without _playbook_service ──────────────────────────────────────────
+
+def test_mixin_static_tools_empty_when_no_service():
+    # With _playbook_service=None, _build_static_tools must return an empty list (not crash).
+    agent = _mixin_agent()
+    agent._playbook_service = None
+    agent.selected_tool_names = []  # required by BaseReActAgent._build_static_tools
+    tools = agent._build_static_tools()
+    assert tools == []
+
+
+def test_mixin_static_tools_has_playbook_tool_when_service_present():
+    # Already tested by test_static_tools_include_playbook_tool; this variant also
+    # checks the tool name explicitly to guard against order changes.
+    agent = _mixin_agent()
+    agent._playbook_service = MagicMock()
+    agent.selected_tool_names = []
+    tools = agent._build_static_tools()
+    assert any(t.name == "Playbook" for t in tools)
+
+
+def test_mixin_static_middleware_empty_when_no_service():
+    # With _playbook_service=None, _build_static_middleware must return [] without raising.
+    agent = _mixin_agent()
+    agent._playbook_service = None
+    mw = agent._build_static_middleware()
+    assert mw == []
+
+
+def test_mixin_static_middleware_present_when_service_set():
+    # With a service, exactly one middleware entry (the listing) is present.
+    agent = _mixin_agent()
+    agent._playbook_service = MagicMock()
+    mw = agent._build_static_middleware()
+    assert len(mw) == 1
+
+
+# ── new gap-closing tests ────────────────────────────────────────────────────────────
+
+# Gap 1: load tool — own PUBLIC playbook is NOT fenced
+# The fence only fires when playbook.owner_id != caller's owner.  An own public
+# playbook (shared with the deployment) must arrive without the fence prefix.
+def test_playbook_tool_own_public_is_not_fenced():
+    svc = MagicMock()
+    svc.get_playbook_by_name.return_value = Playbook(
+        id=3, name="my-public", description="d", body="MY PUBLIC BODY",
+        owner_id="c1", visibility="public",
+    )
+    tool = create_playbook_tool(svc, _owner)  # _owner() == "c1"
+    out = tool.invoke({"playbook": "my-public"})
+    # No fence for own playbooks, regardless of visibility.
+    assert "Public playbook shared by another user" not in out
+    assert out == "MY PUBLIC BODY"
+
+
+# Gap 2: contextvar isolation — _PLAYBOOK_OWNER does not leak across copy_context() scopes
+def test_playbook_owner_contextvar_does_not_leak_across_contexts():
+    import contextvars
+    set_playbook_owner("outer-owner")
+
+    seen = []
+    def _inner():
+        # A fresh copy of the context starts with whatever was set at copy time,
+        # but mutations inside the copy do not affect the outer context.
+        set_playbook_owner("inner-owner")
+        seen.append(get_playbook_owner())
+
+    ctx = contextvars.copy_context()
+    ctx.run(_inner)
+
+    # The inner context saw its own value.
+    assert seen == ["inner-owner"]
+    # The outer context is unchanged.
+    assert get_playbook_owner() == "outer-owner"
+    set_playbook_owner(None)  # cleanup
+
+
+# Gap 3: contextvar isolation — _PENDING_PLAYBOOK does not leak across copy_context() scopes
+def test_pending_playbook_contextvar_does_not_leak_across_contexts():
+    import contextvars
+    clear_pending_playbook()
+
+    seen = []
+    def _inner():
+        set_pending_playbook("inner-plan", "inner-body", playbook_id=77)
+        seen.append(get_pending_playbook())
+
+    ctx = contextvars.copy_context()
+    ctx.run(_inner)
+
+    # Inner context saw its value.
+    assert seen[0]["name"] == "inner-plan"
+    # Outer context was not changed.
+    assert get_pending_playbook() is None
+
+
+# Gap 4: update tool — visibility-only change passes visibility but leaves body/desc None
+def test_update_playbook_visibility_only_passes_only_visibility():
+    svc = MagicMock()
+    svc.get_playbook_by_name.return_value = _existing()
+    svc.update_playbook.return_value = _existing()
+    tool = create_update_playbook_tool(svc, _owner)
+    out = tool.invoke({"name": "s", "visibility": "public"})
+    assert "Updated playbook" in out
+    svc.update_playbook.assert_called_once_with(
+        "c1", 7, name=None, description=None, body=None, visibility="public"
+    )
+
+
+# Gap 5: update tool — visibility="public" produces the sharing confirmation message
+def test_update_playbook_visibility_public_reports_sharing():
+    svc = MagicMock()
+    svc.get_playbook_by_name.return_value = _existing()
+    svc.update_playbook.return_value = _existing()
+    tool = create_update_playbook_tool(svc, _owner)
+    out = tool.invoke({"name": "s", "visibility": "public"})
+    assert "public to everyone on this deployment" in out
+
+
+# Gap 6: listing budget boundary — exactly at budget → no truncation; one char over → truncation
+def test_listing_budget_boundary_exact_vs_over():
+    from src.archi.pipelines.agents.tools.playbook_tools import (
+        _LISTING_CHAR_BUDGET, PLAYBOOK_LISTING_PREAMBLE,
+    )
+    # Build a single playbook whose catalog line (including "- name: " prefix) makes the
+    # final catalog string land exactly at _LISTING_CHAR_BUDGET, then one char over.
+    prefix = "- x: "
+    # catalog length == len(prefix) + len(desc)
+    exact_desc_len = _LISTING_CHAR_BUDGET - len(prefix)
+    desc_exact = "a" * exact_desc_len
+
+    def _svc(desc):
+        svc = MagicMock()
+        svc.list_playbooks.return_value = [
+            Playbook(id=1, name="x", description=desc, body="", owner_id="c1")
+        ]
+        return svc
+
+    # Exactly at budget: len(catalog) == _LISTING_CHAR_BUDGET → no truncation, no "…"
+    out_exact = format_playbook_listing(_svc(desc_exact), "c1")
+    assert "…" not in out_exact
+    # Load-bearing: the FULL untruncated description must render. A boundary
+    # off-by-one (>= instead of >) would truncate it, failing this assert.
+    assert desc_exact in out_exact
+
+    # One char over: len(catalog) > _LISTING_CHAR_BUDGET → truncation with "…"
+    desc_over = "a" * (exact_desc_len + 1)
+    out_over = format_playbook_listing(_svc(desc_over), "c1")
+    assert "…" in out_over
+    # The over-budget description is truncated, so the full string is gone.
+    assert desc_over not in out_over
+
+
+# Gap 7: _normalize_visibility unit — "team" maps to "public", others pass through
+def test_normalize_visibility_team_becomes_public():
+    from src.utils.playbook_service import _normalize_visibility
+    assert _normalize_visibility("team") == "public"
+    assert _normalize_visibility("public") == "public"
+    assert _normalize_visibility("private") == "private"
+    assert _normalize_visibility("unknown") == "unknown"
+
+
+# Gap 8: delete tool — confirmed=False with the name missing returns prompt without deleting
+# (This differs from test_delete_playbook_requires_confirmation_first: that test proves
+# no delete occurs for an EXISTING playbook; this test proves not-found is caught FIRST,
+# even with confirmed=False — i.e. the lookup happens before the confirmation gate.)
+def test_delete_playbook_not_found_before_confirmation_gate():
+    svc = MagicMock()
+    svc.get_playbook_by_name.side_effect = PlaybookNotFoundError("nope")
+    svc.list_playbooks.return_value = []
+    tool = create_delete_playbook_tool(svc, _owner)
+    # confirmed=False (default) — not-found must be reported, NOT the confirmation prompt
+    out = tool.invoke({"name": "ghost"})
+    assert "No playbook named 'ghost'" in out
+    assert "cannot be undone" not in out.lower()
+    svc.delete_playbook.assert_not_called()

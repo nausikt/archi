@@ -859,7 +859,7 @@ class TestPlaybookService:
         clear_pending_playbook()
         assert get_pending_playbook() is None
         set_pending_playbook("deploy-checklist", "BODY")
-        assert get_pending_playbook() == {"name": "deploy-checklist", "body": "BODY", "foreign": False}
+        assert get_pending_playbook() == {"name": "deploy-checklist", "body": "BODY", "foreign": False, "playbook_id": None}
         set_pending_playbook("public-runbook", "B", foreign=True)
         assert get_pending_playbook()["foreign"] is True
         clear_pending_playbook()
@@ -873,6 +873,154 @@ class TestPlaybookService:
         svc._get_connection()
         pool.get_connection_direct.assert_called_once()
         pool.get_connection.assert_not_called()
+
+    # ── Boundary: name length ──────────────────────────────────────────────────
+
+    def test_validate_accepts_name_exactly_64_chars(self):
+        # Spec limit: max 64 chars inclusive — the 64th character must NOT be rejected.
+        name_64 = "a" * 32 + "-" + "b" * 31   # 64 chars, valid kebab-case
+        assert len(name_64) == 64
+        PlaybookService._validate(name_64, "desc", "body")  # must not raise
+
+    def test_validate_rejects_name_65_chars(self):
+        # One character over the limit is rejected regardless of content.
+        name_65 = "a" * 32 + "-" + "b" * 32   # 65 chars
+        assert len(name_65) == 65
+        with pytest.raises(PlaybookValidationError, match="64"):
+            PlaybookService._validate(name_65, "desc", "body")
+
+    # ── Boundary: body length ──────────────────────────────────────────────────
+
+    def test_validate_accepts_body_exactly_16384_chars(self):
+        # MAX_BODY_CHARS == 16384; the boundary value itself must be accepted.
+        PlaybookService._validate("ok", "desc", "x" * 16384)  # must not raise
+
+    # (16385 already tested by test_validate_rejects_oversized_body)
+
+    # ── Boundary: description length ──────────────────────────────────────────
+
+    def test_validate_accepts_description_exactly_1024_chars(self):
+        # MAX_DESCRIPTION_CHARS == 1024; the boundary value must be accepted.
+        # (The description regex also rejects control chars; use plain ASCII.)
+        PlaybookService._validate("ok", "d" * 1024, "body")  # must not raise
+
+    # (1025 already tested by test_validate_rejects_oversized_description)
+
+    # ── Control chars in description ──────────────────────────────────────────
+
+    def test_validate_rejects_tab_in_description(self):
+        # A tab (\x09) is a control character — descriptions embed in system prompts
+        # where tabs would corrupt whitespace layout.
+        with pytest.raises(PlaybookValidationError, match="single line"):
+            PlaybookService._validate("ok", "desc\there", "body")
+
+    def test_validate_rejects_carriage_return_in_description(self):
+        # A CR (\x0d) can forge line breaks in rendered system-prompt output.
+        with pytest.raises(PlaybookValidationError, match="single line"):
+            PlaybookService._validate("ok", "desc\rhere", "body")
+
+    # ── NUL in name ───────────────────────────────────────────────────────────
+
+    def test_validate_rejects_nul_in_name(self):
+        # NUL is not in [a-z0-9\-], so _NAME_RE already rejects it.  The error
+        # message references "lowercase" (the name-format rule), not "NUL", which
+        # is fine because the root cause is an invalid character, not the NUL check.
+        with pytest.raises(PlaybookValidationError, match="lowercase"):
+            PlaybookService._validate("na\x00me", "desc", "body")
+
+    # ── Owner cap boundary: 99 existing → allows creation ─────────────────────
+
+    def test_create_playbook_allows_at_99_existing(self, mock_pool, mock_connection):
+        # One below the cap (99) must proceed to the INSERT, not raise.
+        conn, cursor = mock_connection
+        cursor.fetchone.side_effect = [
+            {"n": 99},      # count query: 99 existing, under the 100 limit
+            {"id": 10, "name": "new-book", "description": "d", "body": "b",
+             "owner_id": "c1", "visibility": "private",
+             "created_at": None, "updated_at": None},
+        ]
+        service = PlaybookService(connection_pool=mock_pool)
+        playbook = service.create_playbook("c1", "new-book", "d", "b")
+        assert playbook.id == 10
+        # The INSERT was attempted (2 execute calls: COUNT + INSERT)
+        assert cursor.execute.call_count == 2
+
+    # ── update: no-op (no fields changed) ────────────────────────────────────
+
+    def test_update_playbook_noop_unchanged(self, mock_pool, mock_connection):
+        # Calling update_playbook with no keyword arguments must still succeed:
+        # the service re-applies the existing values and commits the row.
+        conn, cursor = mock_connection
+        existing = {"id": 5, "name": "stable", "description": "same desc",
+                    "body": "same body", "owner_id": "c1", "visibility": "private",
+                    "created_at": None, "updated_at": None}
+        cursor.fetchone.side_effect = [existing, existing]  # get_playbook, UPDATE RETURNING
+        service = PlaybookService(connection_pool=mock_pool)
+        result = service.update_playbook("c1", 5)   # no kwargs → no-op values
+        assert result.name == "stable"
+        conn.commit.assert_called()
+
+    # ── get_playbook_by_name shadowing: own row wins over a public row ────────
+
+    def test_get_playbook_by_name_returns_owners_row_when_public_also_exists(
+        self, mock_pool, mock_connection
+    ):
+        # When the DB (correctly ordered) returns the owner's own row first,
+        # get_playbook_by_name must return that row — not a foreign public one.
+        conn, cursor = mock_connection
+        owner_row = {
+            "id": 11, "name": "deploy", "description": "my version", "body": "own body",
+            "owner_id": "c1", "visibility": "private", "created_at": None, "updated_at": None,
+        }
+        # The real ORDER BY (owner_id = %s) DESC places the owner's row first;
+        # fetchone picks the first row, which is the owner's.
+        cursor.fetchone.return_value = owner_row
+        service = PlaybookService(connection_pool=mock_pool)
+        result = service.get_playbook_by_name("c1", "deploy", include_public=True)
+        # Must be the owner's row, not any hypothetical public row.
+        assert result.id == 11
+        assert result.owner_id == "c1"
+        assert result.description == "my version"
+        # Verify the SQL sends owner_id twice (for WHERE and for ORDER BY)
+        sql, params = cursor.execute.call_args[0]
+        assert params.count("c1") == 2
+        assert "ORDER BY (owner_id = %s) DESC" in sql
+
+    # ── SQL_INSERT_PLAYBOOK_TURN idempotency ──────────────────────────────────
+
+    def test_sql_insert_playbook_turn_is_idempotent_upsert(self):
+        # The side-table INSERT must be safe to replay with the same message_id.
+        from src.utils import sql
+        assert "ON CONFLICT (message_id) DO NOTHING" in sql.SQL_INSERT_PLAYBOOK_TURN
+
+    # ── render/parse: multi-line body round-trip ──────────────────────────────
+
+    def test_render_parse_round_trip_multiline_body(self):
+        from src.utils.playbook_service import render_playbook_md, parse_playbook_md
+        multi_body = "Step 1: Do X\n\nStep 2: Do Y\n  - sub item\nStep 3: Done"
+        md = render_playbook_md("my-playbook", "A useful description.", multi_body, "public")
+        parsed = parse_playbook_md(md)
+        assert parsed["name"] == "my-playbook"
+        assert parsed["body"] == multi_body
+        assert parsed["visibility"] == "public"
+
+    # ── parse: unclosed frontmatter fence ────────────────────────────────────
+
+    def test_parse_playbook_md_rejects_unclosed_frontmatter(self):
+        from src.utils.playbook_service import parse_playbook_md
+        # A SKILL.md that opens '---' but never closes it is malformed.
+        with pytest.raises(PlaybookValidationError, match="frontmatter"):
+            parse_playbook_md("---\nname: a\ndescription: d\n")
+
+    # ── parse: top-level visibility key (not under metadata) ──────────────────
+
+    def test_parse_playbook_md_reads_top_level_visibility(self):
+        # Some exporters may emit 'visibility' at the top level (not nested under
+        # 'metadata').  The parser accepts both layouts.
+        from src.utils.playbook_service import parse_playbook_md
+        md = "---\nname: a\ndescription: d\nvisibility: public\n---\nBODY"
+        parsed = parse_playbook_md(md)
+        assert parsed["visibility"] == "public"
 
 
 # =============================================================================
@@ -1018,3 +1166,435 @@ class TestResolvePlaybookOwner:
         assert _normalize_visibility("private") == "private"
         md = "---\nname: a\ndescription: d\nmetadata:\n  visibility: team\n---\nB"
         assert parse_playbook_md(md)["visibility"] == "public"
+
+    def test_auth_disabled_logged_in_uses_request_client_id(self):
+        """Auth disabled always ignores session state and uses the request client_id.
+
+        An unusual-but-possible state: auth_enabled=False yet logged_in=True (e.g.
+        the frontend still has a stale session flag after an operator toggle). The
+        function must fall through to the anonymous branch and trust the client_id.
+        """
+        owner, err = resolve_playbook_owner(
+            auth_enabled=False,
+            logged_in=True,
+            session_user={"email": "alice@example.com"},
+            request_client_id="anon-cid",
+        )
+        assert owner == "anon-cid"
+        assert err is None
+
+    def test_authed_logged_in_session_user_none_fails_closed(self):
+        """auth_enabled=True, logged_in=True but session_user is None → fail closed.
+
+        session_user=None means the session dict was never set; the service must NOT
+        fall back to request_client_id (that would re-open the IDOR).
+        """
+        owner, err = resolve_playbook_owner(
+            auth_enabled=True,
+            logged_in=True,
+            session_user=None,
+            request_client_id="attacker-uuid",
+        )
+        assert owner is None
+        assert err is not None
+        assert owner != "attacker-uuid"
+
+    def test_anon_empty_string_client_id_returns_error(self):
+        """An empty-string client_id is treated the same as None (missing).
+
+        Empty strings are falsy in Python, so the `if not request_client_id` guard
+        fires for both None and "".
+        """
+        owner, err = resolve_playbook_owner(
+            auth_enabled=False,
+            logged_in=False,
+            session_user=None,
+            request_client_id="",
+        )
+        assert owner is None
+        assert err == "client_id is required"
+
+
+def test_side_table_sql_queries_defined():
+    from src.utils import sql
+    assert "conversation_playbook_turns" in sql.SQL_INSERT_PLAYBOOK_TURN
+    assert "ON CONFLICT" in sql.SQL_INSERT_PLAYBOOK_TURN
+    assert "conversation_playbook_turns" in sql.SQL_LAST_PLAYBOOK_NAME_FOR_SENDER
+
+
+def test_sql_insert_convo_is_nine_shared_columns():
+    from src.utils import sql
+    assert "playbook_name" not in sql.SQL_INSERT_CONVO
+    for col in ("archi_service", "conversation_id", "sender", "content",
+                "link", "context", "ts", "model_used", "pipeline_used"):
+        assert col in sql.SQL_INSERT_CONVO
+
+
+def test_conversation_service_insert_tuple_is_nine_fields(mock_pool, mock_connection):
+    import src.utils.conversation_service as cs
+    import psycopg2.extras
+    captured = {}
+    def fake_execute_values(cur, sql, values, *a, **k):
+        captured["values"] = values
+        return []
+    svc = cs.ConversationService(connection_pool=mock_pool)
+    msg = cs.Message(archi_service="chat", conversation_id=1, sender="User",
+                     content="hi", link="", context="", model_used="m", pipeline_used="p")
+    orig = cs.execute_values
+    cs.execute_values = fake_execute_values
+    try:
+        svc.insert_messages([msg])
+    except Exception:
+        pass  # mocked-pool fallout is fine; we only care about captured values
+    finally:
+        cs.execute_values = orig
+    assert "values" in captured
+    assert len(captured["values"][0]) == 9
+
+
+def test_load_query_reads_playbook_from_side_table():
+    from src.utils import sql
+    assert "conversation_playbook_turns cpt" in sql.SQL_QUERY_CONVO_WITH_FEEDBACK
+    assert "cpt.playbook_name" in sql.SQL_QUERY_CONVO_WITH_FEEDBACK
+    assert "c.playbook_name" not in sql.SQL_QUERY_CONVO_WITH_FEEDBACK
+
+
+def test_last_user_playbook_name_uses_side_table_query():
+    """_last_user_playbook_name must issue SQL_LAST_PLAYBOOK_NAME_FOR_SENDER (side table), not
+    the old inline SELECT on conversations.playbook_name.
+
+    app.py cannot be imported in the unit-test environment (mistune, flask etc. absent), so
+    we verify the method source text directly via the raw file."""
+    import pathlib
+    app_src = (
+        pathlib.Path(__file__).parent.parent.parent
+        / "src" / "interfaces" / "chat_app" / "app.py"
+    ).read_text()
+
+    # Locate just the method body so we don't match other code in the file.
+    method_start = app_src.index("def _last_user_playbook_name(")
+    # End at the next top-level def / class at the same indent (4 spaces).
+    method_body = app_src[method_start:app_src.index("\n    def ", method_start + 1)]
+
+    assert "SELECT playbook_name FROM conversations" not in method_body, (
+        "_last_user_playbook_name still contains the old inline SQL"
+    )
+    assert "SQL_LAST_PLAYBOOK_NAME_FOR_SENDER" in method_body, (
+        "_last_user_playbook_name does not use SQL_LAST_PLAYBOOK_NAME_FOR_SENDER"
+    )
+
+
+def test_init_sql_conversations_has_no_playbook_name():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    for rel in ("src/cli/templates/init.sql", "tests/smoke/init-test.sql"):
+        text = (root / rel).read_text()
+        start = text.index("CREATE TABLE IF NOT EXISTS conversations")
+        end = text.index(");", start)
+        assert "playbook_name" not in text[start:end], rel
+
+
+# =============================================================================
+# New gap-filling tests (Categories 1-6)
+# =============================================================================
+
+class TestResolvePlaybookOwnerGaps:
+    """Additional resolve_playbook_owner tests covering gaps not addressed above."""
+
+    def test_authed_logged_in_full_session_email_wins_over_all(self):
+        """When session_user has email, sub, id, and name all set, email wins (highest precedence)."""
+        owner, err = resolve_playbook_owner(
+            auth_enabled=True,
+            logged_in=True,
+            session_user={"email": "a@b.c", "sub": "S", "id": "I", "name": "N"},
+            request_client_id="different-uuid",
+        )
+        assert owner == "a@b.c"
+        assert err is None
+        # client_id must be ignored — the IDOR fix
+        assert owner != "different-uuid"
+
+    def test_authed_logged_in_id_fallback_when_no_email_or_sub(self):
+        """When session_user has only 'id', it must be used (email > sub > id > name precedence)."""
+        owner, err = resolve_playbook_owner(
+            auth_enabled=True,
+            logged_in=True,
+            session_user={"id": "oidc-subject-id"},
+            request_client_id="ignored-uuid",
+        )
+        assert owner == "oidc-subject-id"
+        assert err is None
+
+    def test_authed_logged_in_empty_string_fields_fall_through_to_name(self):
+        """Empty strings for email/sub/id are falsy → fall through to 'name'."""
+        owner, err = resolve_playbook_owner(
+            auth_enabled=True,
+            logged_in=True,
+            session_user={"email": "", "sub": "", "id": "", "name": "FallbackName"},
+            request_client_id="ignored-uuid",
+        )
+        assert owner == "FallbackName"
+        assert err is None
+
+    def test_auth_disabled_logged_in_true_nul_client_id_rejected(self):
+        """Auth disabled branch: NUL in client_id is rejected even when logged_in=True."""
+        owner, err = resolve_playbook_owner(
+            auth_enabled=False,
+            logged_in=True,
+            session_user={"email": "a@b.c"},
+            request_client_id="bad\x00id",
+        )
+        assert owner is None
+        assert "NUL" in err
+
+    def test_authed_not_logged_in_nul_client_id_rejected(self):
+        """Auth enabled, not logged in branch: NUL in client_id still rejected."""
+        owner, err = resolve_playbook_owner(
+            auth_enabled=True,
+            logged_in=False,
+            session_user=None,
+            request_client_id="cli\x00ent",
+        )
+        assert owner is None
+        assert "NUL" in err
+
+
+class TestValidateGaps:
+    """Gap tests for PlaybookService._validate not covered by existing tests."""
+
+    def test_validate_name_with_trailing_newline_rejected(self):
+        """\\Z anchor: 'ok-name\\n' must be rejected even though 'ok-name' would pass."""
+        with pytest.raises(PlaybookValidationError, match="lowercase"):
+            PlaybookService._validate("ok-name\n", "desc", "body")
+
+    def test_validate_accepts_valid_name_with_number(self):
+        """'valid-name-1' is a perfectly legal kebab-case name; must not raise."""
+        PlaybookService._validate("valid-name-1", "A good description", "body text")
+
+    def test_validate_accepts_single_segment_name(self):
+        """A single lowercase word with no hyphens is valid."""
+        PlaybookService._validate("abc", "desc", "body")
+
+    def test_validate_rejects_empty_name(self):
+        """An empty string for name must be rejected (falsy check before regex)."""
+        with pytest.raises(PlaybookValidationError, match="lowercase"):
+            PlaybookService._validate("", "desc", "body")
+
+    def test_validate_rejects_del_char_in_description(self):
+        """chr(0x7f) DEL is a control character and must be rejected in descriptions."""
+        with pytest.raises(PlaybookValidationError, match="single line"):
+            PlaybookService._validate("ok", "desc\x7fhere", "body")
+
+    def test_validate_rejects_nul_in_description(self):
+        """NUL (0x00) in description falls under the control-char regex [\\x00-\\x1f\\x7f]."""
+        with pytest.raises(PlaybookValidationError, match="single line"):
+            PlaybookService._validate("ok", "desc\x00here", "body")
+
+    def test_validate_rejects_empty_body(self):
+        """Empty body string must be rejected."""
+        with pytest.raises(PlaybookValidationError, match="body"):
+            PlaybookService._validate("ok", "desc", "")
+
+    def test_validate_rejects_whitespace_only_body(self):
+        """A body of only spaces/tabs must be rejected (body.strip() is falsy)."""
+        with pytest.raises(PlaybookValidationError, match="body"):
+            PlaybookService._validate("ok", "desc", "   \t\n   ")
+
+    def test_validate_accepts_private_visibility(self):
+        """'private' is a valid visibility; must not raise."""
+        PlaybookService._validate("ok", "desc", "body", "private")
+
+    def test_validate_accepts_public_visibility(self):
+        """'public' is a valid visibility; must not raise."""
+        PlaybookService._validate("ok", "desc", "body", "public")
+
+    def test_validate_rejects_team_visibility(self):
+        """'team' is a legacy alias normalized before _validate — _validate itself rejects it."""
+        with pytest.raises(PlaybookValidationError, match="visibility"):
+            PlaybookService._validate("ok", "desc", "body", "team")
+
+    def test_validate_rejects_uppercase_only_name(self):
+        """Uppercase letters are not in [a-z0-9], must be rejected."""
+        with pytest.raises(PlaybookValidationError, match="lowercase"):
+            PlaybookService._validate("UPPERCASE", "desc", "body")
+
+
+class TestNormalizeVisibilityGaps:
+    """Gap tests for _normalize_visibility not covered by the existing tests."""
+
+    def test_normalize_visibility_other_value_passes_through(self):
+        """An unrecognised value (not 'team') is returned unchanged — normalization only maps 'team'."""
+        from src.utils.playbook_service import _normalize_visibility
+        assert _normalize_visibility("other") == "other"
+        assert _normalize_visibility("") == ""
+        assert _normalize_visibility("PRIVATE") == "PRIVATE"
+
+    def test_normalize_visibility_all_known_values(self):
+        """Exhaustive check: private and public are returned unchanged; team maps to public."""
+        from src.utils.playbook_service import _normalize_visibility
+        assert _normalize_visibility("private") == "private"
+        assert _normalize_visibility("public") == "public"
+        assert _normalize_visibility("team") == "public"
+
+
+class TestRowToPlaybookGaps:
+    """Gap tests for PlaybookService._row_to_playbook not covered by existing tests."""
+
+    def test_row_to_playbook_missing_visibility_defaults_to_private(self):
+        """A row without a 'visibility' key (leaner test/mock dicts) must default to 'private'."""
+        row = {
+            "id": 1, "name": "x", "description": "d", "body": "b",
+            "owner_id": "c1",
+            "created_at": None, "updated_at": None,
+            # 'visibility' deliberately absent
+        }
+        pb = PlaybookService._row_to_playbook(row)
+        assert pb.visibility == "private"
+
+    def test_row_to_playbook_none_timestamps_remain_none(self):
+        """created_at/updated_at None in the row → Playbook.created_at/updated_at are None."""
+        row = {
+            "id": 2, "name": "y", "description": "d2", "body": "b2",
+            "owner_id": "c2", "visibility": "public",
+            "created_at": None, "updated_at": None,
+        }
+        pb = PlaybookService._row_to_playbook(row)
+        assert pb.created_at is None
+        assert pb.updated_at is None
+
+    def test_row_to_playbook_datetime_timestamp_is_stringified(self):
+        """A datetime object in created_at/updated_at is converted to str(...)."""
+        ts = datetime(2025, 1, 15, 12, 30, 0)
+        row = {
+            "id": 3, "name": "z", "description": "d3", "body": "b3",
+            "owner_id": "c3", "visibility": "private",
+            "created_at": ts, "updated_at": ts,
+        }
+        pb = PlaybookService._row_to_playbook(row)
+        assert pb.created_at == str(ts)
+        assert pb.updated_at == str(ts)
+
+    def test_row_to_playbook_string_timestamp_is_stringified(self):
+        """A string timestamp value is wrapped in str() (no-op, still a string)."""
+        ts_str = "2025-06-01T10:00:00"
+        row = {
+            "id": 4, "name": "w", "description": "d4", "body": "b4",
+            "owner_id": "c4", "visibility": "public",
+            "created_at": ts_str, "updated_at": ts_str,
+        }
+        pb = PlaybookService._row_to_playbook(row)
+        assert pb.created_at == ts_str
+        assert pb.updated_at == ts_str
+
+    def test_row_to_playbook_explicit_none_visibility_defaults_to_private(self):
+        """visibility=None in the row (e.g. old rows pre-migration) → 'private' via `or`."""
+        row = {
+            "id": 5, "name": "v", "description": "d5", "body": "b5",
+            "owner_id": "c5", "visibility": None,
+            "created_at": None, "updated_at": None,
+        }
+        pb = PlaybookService._row_to_playbook(row)
+        assert pb.visibility == "private"
+
+
+class TestRenderPlaybookMdGaps:
+    """Gap tests for render_playbook_md not covered by existing round-trip tests."""
+
+    def test_render_public_includes_metadata_visibility(self):
+        """A public playbook must have 'metadata:' with 'visibility: public' in the YAML front."""
+        from src.utils.playbook_service import render_playbook_md
+        md = render_playbook_md("my-tool", "Does a thing", "Step 1", "public")
+        assert "metadata:" in md
+        assert "visibility: public" in md
+
+    def test_render_private_has_no_metadata_key(self):
+        """A private playbook must NOT include the 'metadata' key at all."""
+        from src.utils.playbook_service import render_playbook_md
+        md = render_playbook_md("my-tool", "Does a thing", "Step 1", "private")
+        assert "metadata" not in md
+
+    def test_render_default_visibility_has_no_metadata_key(self):
+        """render_playbook_md(visibility omitted) defaults to private → no metadata key."""
+        from src.utils.playbook_service import render_playbook_md
+        md = render_playbook_md("my-tool", "Desc", "Body")
+        assert "metadata" not in md
+
+    def test_render_unicode_preserved_in_body_and_description(self):
+        """Unicode in description and body must survive serialization unchanged."""
+        from src.utils.playbook_service import render_playbook_md
+        md = render_playbook_md("unicode-tool", "Triage résumé: naïve café", "步骤1: 完成\nStep2: Done")
+        assert "résumé" in md
+        assert "步骤1" in md
+
+    def test_render_body_trailing_whitespace_is_rstripped(self):
+        """Body with trailing whitespace/newlines is rstripped in the output."""
+        from src.utils.playbook_service import render_playbook_md
+        md = render_playbook_md("t", "d", "Body line   \n\n\n")
+        # The rendered body section (after the second ---) must not have trailing blank lines
+        body_section = md.split("---\n\n", 1)[1]
+        assert not body_section.endswith("\n\n")
+        # Body content itself is present without the trailing spaces/blank lines
+        assert "Body line" in body_section
+
+    def test_render_output_starts_with_triple_dash(self):
+        """render_playbook_md output must always start with the '---' fence."""
+        from src.utils.playbook_service import render_playbook_md
+        md = render_playbook_md("t", "d", "b")
+        assert md.startswith("---\n")
+
+    def test_render_frontmatter_name_before_description(self):
+        """Agent Skills spec: 'name' must appear before 'description' in the YAML frontmatter."""
+        from src.utils.playbook_service import render_playbook_md
+        md = render_playbook_md("a-tool", "A description", "body")
+        # Find positions in the YAML block
+        name_pos = md.index("name:")
+        desc_pos = md.index("description:")
+        assert name_pos < desc_pos, "name must appear before description in frontmatter"
+
+
+class TestParsePlaybookMdGaps:
+    """Gap tests for parse_playbook_md not covered by existing tests."""
+
+    def test_parse_broken_yaml_frontmatter_raises_validation_error(self):
+        """Structurally broken YAML (e.g. unmatched colon) → PlaybookValidationError."""
+        from src.utils.playbook_service import parse_playbook_md
+        malformed = "---\nname: valid\ndescription: d\nbad: : colon: x\n---\nBODY"
+        with pytest.raises(PlaybookValidationError, match="YAML"):
+            parse_playbook_md(malformed)
+
+    def test_parse_frontmatter_list_not_dict_raises_validation_error(self):
+        """Frontmatter that parses to a YAML list (not a dict) → PlaybookValidationError."""
+        from src.utils.playbook_service import parse_playbook_md
+        list_fm = "---\n- a\n- b\n---\nBODY"
+        with pytest.raises(PlaybookValidationError, match="mapping"):
+            parse_playbook_md(list_fm)
+
+    def test_parse_metadata_visibility_team_normalizes_to_public(self):
+        """metadata.visibility='team' (legacy) must be normalized to 'public'."""
+        from src.utils.playbook_service import parse_playbook_md
+        md = "---\nname: a\ndescription: d\nmetadata:\n  visibility: team\n---\nB"
+        parsed = parse_playbook_md(md)
+        assert parsed["visibility"] == "public"
+
+    def test_parse_leading_blank_lines_before_fence_tolerated(self):
+        """Leading blank lines before the opening '---' are skipped (the parser loops over them)."""
+        from src.utils.playbook_service import parse_playbook_md
+        md = "\n\n---\nname: my-playbook\ndescription: d\n---\nBODY"
+        parsed = parse_playbook_md(md)
+        assert parsed["name"] == "my-playbook"
+        assert parsed["body"] == "BODY"
+
+    def test_parse_unknown_frontmatter_keys_tolerated(self):
+        """Extra/unknown YAML keys in frontmatter must not raise (spec allows extras)."""
+        from src.utils.playbook_service import parse_playbook_md
+        md = "---\nname: a\ndescription: d\nlicense: MIT\nauthor: bob\n---\nBODY"
+        parsed = parse_playbook_md(md)
+        assert parsed["name"] == "a"
+        assert parsed["body"] == "BODY"
+
+    def test_parse_frontmatter_scalar_not_dict_raises_validation_error(self):
+        """Frontmatter that parses to a plain scalar (e.g. just '42') → PlaybookValidationError."""
+        from src.utils.playbook_service import parse_playbook_md
+        scalar_fm = "---\n42\n---\nBODY"
+        with pytest.raises(PlaybookValidationError, match="mapping"):
+            parse_playbook_md(scalar_fm)
