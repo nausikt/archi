@@ -7,7 +7,7 @@
 SQL_INSERT_CONVO = """
 INSERT INTO conversations (
     archi_service, conversation_id, sender, content, link, context, ts,
-    model_used, pipeline_used
+    model_used, pipeline_used, playbook_name
 )
 VALUES %s
 RETURNING message_id;
@@ -45,7 +45,8 @@ SELECT c.sender,
        c.message_id,
        lf.feedback,
        COALESCE(cf.comment_count, 0) AS comment_count,
-       c.model_used
+       c.model_used,
+       c.playbook_name
 FROM conversations c
 LEFT JOIN (
     SELECT DISTINCT ON (mid)

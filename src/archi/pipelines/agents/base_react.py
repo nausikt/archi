@@ -20,10 +20,29 @@ from src.archi.providers.base import ProviderType
 from src.archi.utils.output_dataclass import PipelineOutput
 from src.archi.pipelines.agents.utils.run_memory import RunMemory
 from src.archi.pipelines.agents.utils.mcp_utils import AsyncLoopThread
-from src.archi.pipelines.agents.tools import initialize_mcp_client
+from src.archi.pipelines.agents.tools import (
+    initialize_mcp_client,
+    create_playbook_tool,
+    create_playbook_listing_middleware,
+    create_save_playbook_tool,
+    create_update_playbook_tool,
+    create_delete_playbook_tool,
+    get_playbook_owner,
+)
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# Interim builds named these tools save_skill/update_skill/delete_skill; specs
+# written against them keep working.
+_LEGACY_PLAYBOOK_TOOL_ALIASES = {
+    "save_skill": "save_playbook",
+    "update_skill": "update_playbook",
+    "delete_skill": "delete_playbook",
+}
+# Replaced by the always-in-context playbook listing + the auto-registered Playbook tool.
+_REMOVED_PLAYBOOK_TOOL_NAMES = {"list_playbooks", "load_playbook"}
+
 
 class BaseReActAgent:
     """
@@ -75,6 +94,11 @@ class BaseReActAgent:
             self.agent_llm = self.llms.get("chat_model") or next(iter(self.llms.values()))
         if self.agent_prompt is None:
             self.agent_prompt = self.prompts.get("agent_prompt")
+
+        # User playbooks: every agent gets the Playbook tool + the always-in-context
+        # listing middleware. The per-request owner is set via set_playbook_owner() /
+        # get_playbook_owner() (see src/.../tools/playbook_tools.py).
+        self._playbook_service = self._init_playbook_service()
 
     def create_run_memory(self) -> RunMemory:
         """Instantiate a fresh run memory for an agent run."""
@@ -1011,20 +1035,93 @@ class BaseReActAgent:
                 continue
             self.prompts[name] = str(prompt_template) # TODO at some point, make a validated prompt class to check these?
 
+    def _init_playbook_service(self):
+        """Obtain a PlaybookService (user-playbook storage) from the process-wide factory."""
+        try:
+            # Deferred import: keeps agent modules importable without forcing the
+            # Postgres service stack at import time (introspection paths build the
+            # agent via __new__).
+            from src.utils.env import read_secret
+            from src.utils.postgres_service_factory import PostgresServiceFactory
+            factory = PostgresServiceFactory.get_instance()
+            if factory is None:
+                factory = PostgresServiceFactory.from_env(
+                    password_override=read_secret("PG_PASSWORD")
+                )
+                PostgresServiceFactory.set_instance(factory)
+            return factory.playbook_service
+        except AttributeError:
+            # Missing playbook_service property = service-factory wiring not landed:
+            # surface it loudly rather than silently disabling playbooks.
+            raise
+        except Exception as e:
+            logger.warning("PlaybookService unavailable; playbooks disabled: %s", e)
+            return None
+
+    def _tool_definitions(self) -> Dict[str, Dict[str, Any]]:
+        """Spec-selectable tools every agent offers; subclasses extend via super().
+
+        The playbook authoring tools are the chat-app analog of editing SKILL.md files:
+        users have no filesystem, so create/update/delete go through tools. They are
+        registered unconditionally — with no PlaybookService they degrade to a polite
+        "playbooks are unavailable" reply. The Playbook (load) tool is not listed here — it
+        is registered automatically alongside the listing middleware when playbooks exist.
+        """
+        return {
+            "save_playbook": {
+                "builder": self._build_save_playbook_tool,
+                "description": "Save a new playbook to the user's personal playbook library.",
+            },
+            "update_playbook": {
+                "builder": self._build_update_playbook_tool,
+                "description": "Modify an existing saved playbook — rename, change its description, or change its body (append or overwrite). Use save_playbook only for brand-new playbooks.",
+            },
+            "delete_playbook": {
+                "builder": self._build_delete_playbook_tool,
+                "description": "Permanently delete a saved playbook by name (only after the user confirms).",
+            },
+        }
+
+    # getattr: introspection paths construct agents via __new__ (no __init__),
+    # and the tools themselves handle a None service gracefully.
+    def _build_save_playbook_tool(self) -> Callable:
+        return create_save_playbook_tool(getattr(self, "_playbook_service", None), get_playbook_owner)
+
+    def _build_update_playbook_tool(self) -> Callable:
+        return create_update_playbook_tool(getattr(self, "_playbook_service", None), get_playbook_owner)
+
+    def _build_delete_playbook_tool(self) -> Callable:
+        return create_delete_playbook_tool(getattr(self, "_playbook_service", None), get_playbook_owner)
+
     def get_tool_registry(self) -> Dict[str, Callable[[], Any]]:
         """Return a mapping of tool names to callables that build tools."""
-        return {}
+        return {name: entry["builder"] for name, entry in self._tool_definitions().items()}
 
     def get_tool_descriptions(self) -> Dict[str, str]:
         """Return a mapping of tool names to descriptions for UI display."""
-        return {}
+        return {name: entry["description"] for name, entry in self._tool_definitions().items()}
 
     def _select_tools_from_registry(self, tool_names: Sequence[str]) -> List[Callable]:
         registry = self.get_tool_registry() or {}
         if not tool_names:
             return []
         tools: List[Callable] = []
+        resolved: set = set()
         for name in tool_names:
+            if name in _REMOVED_PLAYBOOK_TOOL_NAMES:
+                logger.info(
+                    "Tool '%s' was removed: the playbook listing is always in context and the "
+                    "Playbook tool loads playbooks on demand.", name,
+                )
+                continue
+            if name in _LEGACY_PLAYBOOK_TOOL_ALIASES:
+                alias = _LEGACY_PLAYBOOK_TOOL_ALIASES[name]
+                logger.warning("Tool name '%s' is deprecated; using '%s'.", name, alias)
+                name = alias
+            if name in resolved:
+                # e.g. a migrating spec listing both save_skill and save_playbook
+                continue
+            resolved.add(name)
             builder = registry.get(name)
             if not builder:
                 logger.warning("Tool '%s' not found in registry for %s", name, self.__class__.__name__)
@@ -1128,10 +1225,15 @@ class BaseReActAgent:
         )
 
     def _build_static_tools(self) -> List[Callable]:
-        """Build and returns static tools defined in the config."""
+        """Static tools from the agent spec, plus the Playbook tool when playbooks exist."""
         selected = list(self.selected_tool_names or [])
         static_names = [name for name in selected if name != "mcp"]
-        return self._select_tools_from_registry(static_names)
+        tools = self._select_tools_from_registry(static_names)
+        if getattr(self, "_playbook_service", None) is not None:
+            tools.append(create_playbook_tool(self._playbook_service, get_playbook_owner))
+        else:
+            logger.info("Playbook tool not registered: no PlaybookService available (playbooks disabled).")
+        return tools
 
     def _build_mcp_tools(self) -> List[Callable]:
         """Retrieve MCP tools from servers defined in the config and keep those server connections alive"""
@@ -1196,7 +1298,10 @@ class BaseReActAgent:
             logger.error(f"Failed to load MCP tools: {e}", exc_info=True)
 
     def _build_static_middleware(self) -> List[Callable]:
-        """Build and returns static middleware defined in the config."""
+        """Static middleware: the playbook listing keeps every playbook's name + description
+        in the system prompt (progressive disclosure Level 1), per request owner."""
+        if getattr(self, "_playbook_service", None) is not None:
+            return [create_playbook_listing_middleware(self._playbook_service, get_playbook_owner)]
         return []
 
     def _store_documents(self, stage: str, docs: Sequence[Document]) -> None:

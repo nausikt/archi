@@ -21,6 +21,12 @@ from src.utils.config_service import ConfigService, StaticConfig, DynamicConfig,
 from src.utils.document_selection_service import DocumentSelectionService, DocumentSelection
 from src.utils.conversation_service import ConversationService, Message, ABComparison
 from src.utils.postgres_service_factory import PostgresServiceFactory, create_services
+from src.utils.playbook_service import (
+    PlaybookService, Playbook,
+    PlaybookValidationError, PlaybookConflictError, PlaybookNotFoundError,
+    resolve_playbook_owner,
+)
+from psycopg2 import errors as pg_errors
 
 
 # =============================================================================
@@ -445,6 +451,13 @@ class TestPostgresServiceFactory:
             assert call_kwargs['min_conn'] == 2
             assert call_kwargs['max_conn'] == 10
 
+    def test_playbook_service_lazy_init(self, mock_pool):
+        factory = PostgresServiceFactory(connection_pool=mock_pool)
+        assert factory._playbook_service is None
+        svc = factory.playbook_service
+        assert isinstance(svc, PlaybookService)
+        assert factory._playbook_service is svc  # cached
+
 
 # =============================================================================
 # Integration-style Tests (with mocked DB)
@@ -517,3 +530,464 @@ class TestDataclasses:
         
         assert ds.document_id == 1
         assert ds.enabled is True  # conversation_override takes precedence
+
+
+class TestPlaybookService:
+    def test_playbook_dataclass_defaults(self):
+        playbook = Playbook(id=1, name="rucio-triage", description="d", body="b", owner_id="c1")
+        assert playbook.created_at is None
+        assert playbook.updated_at is None
+
+    def test_validate_rejects_bad_name(self):
+        service = PlaybookService(connection_pool=MagicMock())
+        with pytest.raises(PlaybookValidationError, match="lowercase"):
+            service.create_playbook("c1", "Bad Name!", "desc", "body")
+
+    def test_validate_rejects_consecutive_hyphens(self):
+        # Agent Skills spec: no leading/trailing/consecutive hyphens.
+        service = PlaybookService(connection_pool=MagicMock())
+        for bad in ("a--b", "-ab", "ab-"):
+            with pytest.raises(PlaybookValidationError, match="hyphens"):
+                service.create_playbook("c1", bad, "desc", "body")
+
+    def test_validate_rejects_empty_description(self):
+        service = PlaybookService(connection_pool=MagicMock())
+        with pytest.raises(PlaybookValidationError, match="description"):
+            service.create_playbook("c1", "ok-name", "  ", "body")
+
+    def test_validate_rejects_oversized_body(self):
+        service = PlaybookService(connection_pool=MagicMock())
+        with pytest.raises(PlaybookValidationError, match="exceeds"):
+            service.create_playbook("c1", "ok-name", "desc", "x" * 16385)
+
+    def test_validate_rejects_oversized_description(self):
+        # the Agent Skills spec limit is 1024 chars
+        service = PlaybookService(connection_pool=MagicMock())
+        with pytest.raises(PlaybookValidationError, match="description exceeds"):
+            service.create_playbook("c1", "ok-name", "d" * 1025, "body")
+
+    def test_validate_accepts_spec_sized_description(self):
+        # 1024 chars is valid under the spec; only the DB call should be reached.
+        pool = MagicMock()
+        service = PlaybookService(connection_pool=pool)
+        try:
+            service.create_playbook("c1", "ok-name", "d" * 1024, "body")
+        except PlaybookValidationError as exc:  # pragma: no cover - regression guard
+            pytest.fail(f"1024-char description rejected: {exc}")
+        except Exception:
+            pass  # mocked-DB fallout is fine; validation passed
+
+    def test_validate_rejects_multiline_description(self):
+        # public descriptions render into OTHER users' system prompts: a newline could
+        # forge extra listing lines there
+        service = PlaybookService(connection_pool=MagicMock())
+        for bad in ("line1\nline2", "tab\there", "bell\x07"):
+            with pytest.raises(PlaybookValidationError, match="single line"):
+                service.create_playbook("c1", "ok-name", bad, "body")
+
+    def test_list_playbooks_without_bodies_skips_body_column(self):
+        pool = MagicMock()
+        conn = pool.get_connection_direct.return_value
+        cursor = conn.cursor.return_value.__enter__.return_value
+        cursor.fetchall.return_value = []
+        PlaybookService(connection_pool=pool).list_playbooks("c1", with_bodies=False)
+        sql = cursor.execute.call_args[0][0]
+        assert "'' AS body" in sql
+
+    def test_validate_rejects_bad_visibility(self):
+        service = PlaybookService(connection_pool=MagicMock())
+        with pytest.raises(PlaybookValidationError, match="visibility"):
+            service.create_playbook("c1", "ok-name", "desc", "body", visibility="everyone")
+
+    def test_create_playbook_forwards_visibility(self, mock_pool, mock_connection):
+        conn, cursor = mock_connection
+        cursor.fetchone.side_effect = [{"n": 0}, {
+            "id": 7, "name": "shared-run", "description": "d", "body": "b",
+            "owner_id": "c1", "visibility": "public",
+            "created_at": None, "updated_at": None,
+        }]
+        service = PlaybookService(connection_pool=mock_pool)
+        playbook = service.create_playbook("c1", "shared-run", "d", "b", visibility="public")
+        assert playbook.visibility == "public"
+        sql, params = cursor.execute.call_args[0]  # last execute = the INSERT
+        assert "visibility" in sql and "public" in params
+
+    def test_list_playbooks_includes_public_rows(self, mock_pool, mock_connection):
+        conn, cursor = mock_connection
+        cursor.fetchall.return_value = []
+        PlaybookService(connection_pool=mock_pool).list_playbooks("c1")
+        sql, params = cursor.execute.call_args[0]
+        # own OR public filter, plus the own-first ordering param
+        assert "visibility = 'public'" in sql
+        assert params.count("c1") == 2
+
+    def test_get_playbook_by_name_public_lookup_prefers_own(self, mock_pool, mock_connection):
+        conn, cursor = mock_connection
+        cursor.fetchone.return_value = {
+            "id": 1, "name": "a", "description": "d", "body": "b",
+            "owner_id": "c1", "visibility": "public", "created_at": None, "updated_at": None,
+        }
+        PlaybookService(connection_pool=mock_pool).get_playbook_by_name("c1", "a", include_public=True)
+        sql, params = cursor.execute.call_args[0]
+        assert "visibility = 'public'" in sql
+        assert "ORDER BY (owner_id = %s) DESC" in sql
+
+    def test_create_playbook_returns_playbook(self, mock_pool, mock_connection):
+        conn, cursor = mock_connection
+        # first fetchone serves the per-owner count check, second the INSERT .. RETURNING row
+        cursor.fetchone.side_effect = [{"n": 0}, {
+            "id": 7, "name": "rucio-triage", "description": "triage transfers",
+            "body": "step 1...", "owner_id": "c1",
+            "created_at": datetime.now(), "updated_at": datetime.now(),
+        }]
+        service = PlaybookService(connection_pool=mock_pool)
+        playbook = service.create_playbook("c1", "rucio-triage", "triage transfers", "step 1...")
+        assert playbook.id == 7
+        assert playbook.name == "rucio-triage"
+        conn.commit.assert_called()
+
+    def test_create_playbook_duplicate_raises_conflict(self, mock_pool, mock_connection):
+        conn, cursor = mock_connection
+        cursor.fetchone.return_value = {"n": 0}
+        # count query succeeds; the INSERT itself hits the unique index
+        cursor.execute.side_effect = [None, pg_errors.UniqueViolation()]
+        service = PlaybookService(connection_pool=mock_pool)
+        with pytest.raises(PlaybookConflictError, match="already exists"):
+            service.create_playbook("c1", "dupe-name", "desc", "body")
+        conn.rollback.assert_called()
+
+    def test_create_playbook_rejects_at_owner_cap(self, mock_pool, mock_connection):
+        conn, cursor = mock_connection
+        cursor.fetchone.return_value = {"n": 100}
+        service = PlaybookService(connection_pool=mock_pool)
+        with pytest.raises(PlaybookValidationError, match="limit reached"):
+            service.create_playbook("c1", "one-too-many", "desc", "body")
+        # only the count query ran — the INSERT was never attempted
+        assert cursor.execute.call_count == 1
+        conn.commit.assert_not_called()
+
+    def test_list_playbooks_returns_list(self, mock_pool, mock_connection):
+        conn, cursor = mock_connection
+        cursor.fetchall.return_value = [
+            {"id": 1, "name": "a", "description": "da", "body": "ba",
+             "owner_id": "c1", "created_at": None, "updated_at": None},
+            {"id": 2, "name": "b", "description": "db", "body": "bb",
+             "owner_id": "c1", "created_at": None, "updated_at": None},
+        ]
+        service = PlaybookService(connection_pool=mock_pool)
+        playbooks = service.list_playbooks("c1")
+        assert [s.name for s in playbooks] == ["a", "b"]
+
+    def test_get_playbook_found(self, mock_pool, mock_connection):
+        conn, cursor = mock_connection
+        cursor.fetchone.return_value = {
+            "id": 3, "name": "c", "description": "dc", "body": "bc",
+            "owner_id": "c1", "created_at": None, "updated_at": None,
+        }
+        service = PlaybookService(connection_pool=mock_pool)
+        assert service.get_playbook("c1", 3).name == "c"
+
+    def test_get_playbook_not_found_raises(self, mock_pool, mock_connection):
+        conn, cursor = mock_connection
+        cursor.fetchone.return_value = None
+        service = PlaybookService(connection_pool=mock_pool)
+        with pytest.raises(PlaybookNotFoundError):
+            service.get_playbook("c1", 999)
+
+    def test_get_playbook_by_name_not_found_raises(self, mock_pool, mock_connection):
+        conn, cursor = mock_connection
+        cursor.fetchone.return_value = None
+        service = PlaybookService(connection_pool=mock_pool)
+        with pytest.raises(PlaybookNotFoundError):
+            service.get_playbook_by_name("c1", "nope")
+
+    def test_update_playbook_commits(self, mock_pool, mock_connection):
+        conn, cursor = mock_connection
+        existing = {"id": 4, "name": "old", "description": "d", "body": "b",
+                    "owner_id": "c1", "created_at": None, "updated_at": None}
+        updated = {**existing, "name": "new"}
+        cursor.fetchone.side_effect = [existing, updated]  # get_playbook, then UPDATE RETURNING
+        service = PlaybookService(connection_pool=mock_pool)
+        result = service.update_playbook("c1", 4, name="new")
+        assert result.name == "new"
+        conn.commit.assert_called()
+
+    def test_update_playbook_not_found_raises(self, mock_pool, mock_connection):
+        conn, cursor = mock_connection
+        cursor.fetchone.return_value = None  # get_playbook finds nothing
+        service = PlaybookService(connection_pool=mock_pool)
+        with pytest.raises(PlaybookNotFoundError):
+            service.update_playbook("c1", 4, name="new")
+
+    def test_delete_playbook_removes_row(self, mock_pool, mock_connection):
+        conn, cursor = mock_connection
+        cursor.rowcount = 1
+        service = PlaybookService(connection_pool=mock_pool)
+        service.delete_playbook("c1", 4)
+        conn.commit.assert_called()
+
+    # ── IDOR invariant: every single-owner query is owner-scoped in SQL + params ──
+
+    def test_read_queries_are_owner_scoped(self, mock_pool, mock_connection):
+        conn, cursor = mock_connection
+        service = PlaybookService(connection_pool=mock_pool)
+        row = {"id": 1, "name": "a", "description": "d", "body": "b",
+               "owner_id": "c1", "created_at": None, "updated_at": None}
+        cursor.fetchall.return_value = []
+        service.list_playbooks("c1")
+        sql, params = cursor.execute.call_args[0]
+        assert "owner_id = %s" in sql and "c1" in params
+        cursor.fetchone.return_value = row
+        service.get_playbook("c1", 1)
+        sql, params = cursor.execute.call_args[0]
+        assert "owner_id = %s" in sql and "c1" in params and 1 in params
+        service.get_playbook_by_name("c1", "a")
+        sql, params = cursor.execute.call_args[0]
+        assert "owner_id = %s" in sql and "c1" in params
+
+    def test_delete_is_owner_scoped(self, mock_pool, mock_connection):
+        conn, cursor = mock_connection
+        cursor.rowcount = 1
+        PlaybookService(connection_pool=mock_pool).delete_playbook("c1", 7)
+        sql, params = cursor.execute.call_args[0]
+        assert "owner_id = %s" in sql and "c1" in params and 7 in params
+
+    def test_update_is_owner_scoped(self, mock_pool, mock_connection):
+        conn, cursor = mock_connection
+        existing = {"id": 4, "name": "old", "description": "d", "body": "b",
+                    "owner_id": "c1", "created_at": None, "updated_at": None}
+        cursor.fetchone.side_effect = [existing, {**existing, "name": "new"}]
+        PlaybookService(connection_pool=mock_pool).update_playbook("c1", 4, name="new")
+        sql, params = cursor.execute.call_args[0]  # last execute = the UPDATE
+        assert "owner_id = %s" in sql and "c1" in params and 4 in params
+
+    def test_delete_playbook_not_found_raises(self, mock_pool, mock_connection):
+        conn, cursor = mock_connection
+        cursor.rowcount = 0
+        service = PlaybookService(connection_pool=mock_pool)
+        with pytest.raises(PlaybookNotFoundError):
+            service.delete_playbook("c1", 999)
+
+    def test_update_playbook_conflict_raises(self, mock_pool, mock_connection):
+        conn, cursor = mock_connection
+        existing = {"id": 4, "name": "old", "description": "d", "body": "b",
+                    "owner_id": "c1", "created_at": None, "updated_at": None}
+        cursor.fetchone.side_effect = [existing]            # get_playbook succeeds
+        cursor.execute.side_effect = [None, pg_errors.UniqueViolation()]  # SELECT ok, UPDATE conflicts
+        service = PlaybookService(connection_pool=mock_pool)
+        with pytest.raises(PlaybookConflictError, match="already exists"):
+            service.update_playbook("c1", 4, name="other-existing")
+        conn.rollback.assert_called()
+
+    def test_playbook_invocation_text_uses_command_block(self):
+        from src.utils.playbook_service import playbook_invocation_text
+        out = playbook_invocation_text("do the thing", "deploy-checklist", "PLAYBOOK BODY")
+        # Claude Code slash-command expansion: command tags carry the invocation,
+        # the body follows; without $ARGUMENTS the text is appended as ARGUMENTS:.
+        assert out.startswith("<command-message>deploy-checklist is running…</command-message>")
+        assert "<command-name>/deploy-checklist</command-name>" in out
+        assert "<command-args>do the thing</command-args>" in out
+        assert "PLAYBOOK BODY" in out
+        assert "ARGUMENTS: do the thing" in out
+
+    def test_playbook_invocation_text_substitutes_arguments(self):
+        from src.utils.playbook_service import playbook_invocation_text
+        out = playbook_invocation_text("T2_US_MIT", "site-check", "inspect $ARGUMENTS closely")
+        assert "inspect T2_US_MIT closely" in out
+        assert "ARGUMENTS:" not in out  # placeholder consumed the args
+
+    def test_playbook_invocation_text_fences_foreign_body(self):
+        from src.utils.playbook_service import playbook_invocation_text
+        out = playbook_invocation_text("go", "theirs", "BODY", foreign=True)
+        assert "Public playbook shared by another user" in out
+
+    def test_playbook_invocation_text_empty_body_unchanged(self):
+        from src.utils.playbook_service import playbook_invocation_text
+        assert playbook_invocation_text("hi", "x", "") == "hi"
+
+    def test_render_and_parse_playbook_md_round_trip(self):
+        from src.utils.playbook_service import render_playbook_md, parse_playbook_md
+        md = render_playbook_md("rucio-triage", "Triage stuck transfers. Use when…", "Step 1\nStep 2", "public")
+        parsed = parse_playbook_md(md)
+        assert parsed == {
+            "name": "rucio-triage",
+            "description": "Triage stuck transfers. Use when…",
+            "body": "Step 1\nStep 2",
+            "visibility": "public",
+        }
+
+    def test_parse_playbook_md_defaults_and_fallbacks(self):
+        from src.utils.playbook_service import parse_playbook_md
+        md = "---\ndescription: d\n---\n\nBODY\n"
+        parsed = parse_playbook_md(md, fallback_name="from-folder")
+        assert parsed["name"] == "from-folder"
+        assert parsed["visibility"] == "private"
+        # unknown frontmatter keys are tolerated (spec allows extras)
+        md2 = "---\nname: a\ndescription: d\nlicense: MIT\n---\nB"
+        assert parse_playbook_md(md2)["name"] == "a"
+
+    def test_parse_playbook_md_rejects_missing_frontmatter(self):
+        from src.utils.playbook_service import parse_playbook_md
+        with pytest.raises(PlaybookValidationError, match="frontmatter"):
+            parse_playbook_md("just a body, no frontmatter")
+
+    def test_parse_playbook_md_ignores_indented_fence(self):
+        # an indented '---' is YAML content (block-scalar continuation), not a fence
+        from src.utils.playbook_service import parse_playbook_md
+        md = "---\nname: a\ndescription: |\n  part one\n  ---\n  part two\n---\nBODY"
+        parsed = parse_playbook_md(md)
+        assert parsed["name"] == "a"
+        assert "part two" in parsed["description"]
+        assert parsed["body"] == "BODY"
+
+    def test_pending_playbook_contextvar_roundtrip(self):
+        from src.archi.pipelines.agents.tools.playbook_tools import (
+            set_pending_playbook, get_pending_playbook, clear_pending_playbook,
+        )
+        clear_pending_playbook()
+        assert get_pending_playbook() is None
+        set_pending_playbook("deploy-checklist", "BODY")
+        assert get_pending_playbook() == {"name": "deploy-checklist", "body": "BODY", "foreign": False}
+        set_pending_playbook("public-runbook", "B", foreign=True)
+        assert get_pending_playbook()["foreign"] is True
+        clear_pending_playbook()
+        assert get_pending_playbook() is None
+
+    def test_get_connection_uses_direct_accessor_with_pool(self):
+        # ConnectionPool.get_connection() is a @contextmanager; PlaybookService manages
+        # the conn manually, so it must use the raw accessor get_connection_direct().
+        pool = MagicMock()
+        svc = PlaybookService(connection_pool=pool)
+        svc._get_connection()
+        pool.get_connection_direct.assert_called_once()
+        pool.get_connection.assert_not_called()
+
+
+# =============================================================================
+# TestResolvePlaybookOwner Tests
+# =============================================================================
+
+class TestResolvePlaybookOwner:
+    """Tests for resolve_playbook_owner — session-identity guard for playbook IDOR mitigation."""
+
+    def test_authed_logged_in_email_returns_email(self):
+        """When auth is on and user is logged in with email, return the email."""
+        owner, err = resolve_playbook_owner(
+            auth_enabled=True,
+            logged_in=True,
+            session_user={"email": "alice@example.com", "name": "Alice"},
+            request_client_id="some-uuid-from-frontend",
+        )
+        assert owner == "alice@example.com"
+        assert err is None
+
+    def test_authed_logged_in_different_client_id_ignored_not_rejected(self):
+        """When auth on and logged in with email, a different request client_id is IGNORED.
+
+        This is the IDOR fix: the frontend legitimately sends a UUID client_id that
+        never equals the SSO email — rejecting it would break authed requests.
+        The server-verified identity wins and the supplied client_id is silently ignored.
+        """
+        owner, err = resolve_playbook_owner(
+            auth_enabled=True,
+            logged_in=True,
+            session_user={"email": "alice@example.com"},
+            request_client_id="attacker-or-unrelated-uuid",
+        )
+        # Must return the session email, not the request client_id, and no error
+        assert owner == "alice@example.com"
+        assert err is None
+        assert owner != "attacker-or-unrelated-uuid"
+
+    def test_authed_logged_in_no_email_falls_back_to_sub(self):
+        """When logged in but no email, use sub as verified identity."""
+        owner, err = resolve_playbook_owner(
+            auth_enabled=True,
+            logged_in=True,
+            session_user={"sub": "sub|12345"},
+            request_client_id="frontend-uuid",
+        )
+        assert owner == "sub|12345"
+        assert err is None
+
+    def test_authed_logged_in_no_email_or_sub_falls_back_to_name(self):
+        """When logged in but no email/sub, use name as verified identity."""
+        owner, err = resolve_playbook_owner(
+            auth_enabled=True,
+            logged_in=True,
+            session_user={"name": "Bob"},
+            request_client_id="frontend-uuid",
+        )
+        assert owner == "Bob"
+        assert err is None
+
+    def test_authed_logged_in_empty_session_user_fails_closed(self):
+        """Logged in but session_user has no usable identity -> fail closed, do NOT trust client_id."""
+        owner, err = resolve_playbook_owner(
+            auth_enabled=True,
+            logged_in=True,
+            session_user={},
+            request_client_id="frontend-uuid",
+        )
+        assert owner is None   # IDOR not re-opened
+        assert err             # error returned
+
+    def test_authed_not_logged_in_uses_request_client_id(self):
+        """Auth enabled but user not logged in → anonymous, use request client_id."""
+        owner, err = resolve_playbook_owner(
+            auth_enabled=True,
+            logged_in=False,
+            session_user=None,
+            request_client_id="anon-uuid",
+        )
+        assert owner == "anon-uuid"
+        assert err is None
+
+    def test_auth_disabled_uses_request_client_id(self):
+        """Auth disabled (anonymous deployment) → always use request client_id."""
+        owner, err = resolve_playbook_owner(
+            auth_enabled=False,
+            logged_in=False,
+            session_user=None,
+            request_client_id="anon-uuid",
+        )
+        assert owner == "anon-uuid"
+        assert err is None
+
+    def test_anon_no_client_id_returns_error(self):
+        """Anonymous + no client_id → rejectable error."""
+        owner, err = resolve_playbook_owner(
+            auth_enabled=False,
+            logged_in=False,
+            session_user=None,
+            request_client_id=None,
+        )
+        assert owner is None
+        assert err == "client_id is required"
+
+    def test_authed_not_logged_in_no_client_id_returns_error(self):
+        """Auth enabled, not logged in, no client_id supplied → rejectable error."""
+        owner, err = resolve_playbook_owner(
+            auth_enabled=True,
+            logged_in=False,
+            session_user=None,
+            request_client_id=None,
+        )
+        assert owner is None
+        assert err == "client_id is required"
+
+    def test_authed_logged_in_oidc_id_shape_returns_id(self):
+        # OIDC callback stores the subject claim under 'id' (not 'sub'), no email.
+        owner, err = resolve_playbook_owner(True, True, {"id": "sub|12345", "email": "", "name": ""}, "attacker-uuid")
+        assert owner == "sub|12345"
+        assert err is None
+
+    def test_legacy_team_visibility_normalizes_to_public(self):
+        # 'team' was the original name for public visibility; old exports and
+        # API clients may still send it
+        from src.utils.playbook_service import _normalize_visibility, parse_playbook_md
+        assert _normalize_visibility("team") == "public"
+        assert _normalize_visibility("public") == "public"
+        assert _normalize_visibility("private") == "private"
+        md = "---\nname: a\ndescription: d\nmetadata:\n  visibility: team\n---\nB"
+        assert parse_playbook_md(md)["visibility"] == "public"

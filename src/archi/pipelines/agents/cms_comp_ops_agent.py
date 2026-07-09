@@ -237,6 +237,9 @@ class CMSCompOpsAgent(BaseReActAgent):
                 "description": "Run aggregation queries on MONIT OpenSearch for CMS HTCondor job metrics.",
             }
 
+        # Generalized playbook authoring tools (save/update/delete) from the base agent.
+        defs.update(super()._tool_definitions())
+
         return defs
 
     def _build_file_search_tool(self) -> Callable:

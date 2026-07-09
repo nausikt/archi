@@ -396,7 +396,11 @@ CREATE TABLE IF NOT EXISTS conversations (
     context TEXT NOT NULL DEFAULT '',
     
     ts TIMESTAMPTZ NOT NULL,
-    
+
+    -- Name of the user-invoked playbook applied to this (user) turn, if any.
+    -- The playbook body is injected only in-flight to the model; `content` stays clean.
+    playbook_name VARCHAR(100),
+
     conf_id INTEGER REFERENCES configs(config_id)
 );
 
@@ -629,6 +633,25 @@ GRANT SELECT ON
     migration_state
 TO grafana;
 {% endif %}
+
+-- ============================================================================
+-- 12. PLAYBOOKS (user-authored playbook library)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS playbooks (
+    id          SERIAL PRIMARY KEY,
+    name        VARCHAR(100) NOT NULL,        -- kebab-case slug, unique per owner
+    description TEXT NOT NULL,                 -- one-line "when to use this" hint
+    body        TEXT NOT NULL,                 -- the instructions/knowledge injected on load
+    owner_id    VARCHAR(200) NOT NULL,         -- verified identity (auth) or client_id (anonymous)
+    visibility  VARCHAR(10) NOT NULL DEFAULT 'private',  -- 'private' | 'public' (read-only for others)
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_playbooks_owner_name ON playbooks(owner_id, name);
+CREATE INDEX IF NOT EXISTS idx_playbooks_owner ON playbooks(owner_id);
+CREATE INDEX IF NOT EXISTS idx_playbooks_public ON playbooks(visibility) WHERE visibility = 'public';
 
 -- ============================================================================
 -- NOTES
