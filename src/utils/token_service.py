@@ -56,6 +56,12 @@ class TokenService:
     must carry ``sso_sid`` to retrieve the token row.
     """
 
+    # Each successful refresh slides the SSO session window this far into the
+    # future, so an actively-chatting user is never forced to re-login. Idle
+    # users still expire once they stop triggering refreshes for this long
+    # (and upstream Keycloak refresh-token lifetime is the hard ceiling).
+    SESSION_SLIDING_SECONDS = 12 * 3600
+
     def __init__(
         self,
         pg_config: Optional[Dict[str, Any]] = None,
@@ -374,9 +380,12 @@ class TokenService:
                     new_tok.get("expires_at")
                     or (now + int(new_tok.get("expires_in", 0)))
                 )
-                # Session row keeps its original expires_at; refresh does not
-                # extend the SSO session beyond what Keycloak granted at login.
 
+                ## Slide the SSO session window forward on each successful
+                # refresh so an actively-chatting user is never forced to
+                # re-login. Idle users still expire once they stop triggering
+                # refreshes for SESSION_SLIDING_SECONDS.
+                new_session_exp = now + self.SESSION_SLIDING_SECONDS
                 cur.execute(
                     """
                     UPDATE sessions
@@ -393,20 +402,22 @@ class TokenService:
                             '{access_expires_at}', to_jsonb(%s::bigint)
                         ),
                         '{refreshed_at}', to_jsonb(EXTRACT(EPOCH FROM NOW())::bigint)
-                    )
+                    ),
+                    expires_at = to_timestamp(%s)
                     WHERE id = %s
                     """,
                     (
                         new_access, self._encryption_key,
                         new_refresh, self._encryption_key,
                         new_access_exp,
+                        new_session_exp,
                         sso_sid,
                     ),
                 )
                 conn.commit()
                 logger.info(
-                    "refreshed sso access token user=%s new_ttl=%ds",
-                    user_id, new_access_exp - now,
+                    "refreshed sso access token user=%s new_ttl=%ds session_ttl=%ds",
+                    user_id, new_access_exp - now, new_session_exp - now,
                 )
                 return new_access
         except Exception as exc:
