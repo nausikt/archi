@@ -3355,6 +3355,22 @@ body {
   border-color: var(--accent);
 }
 
+/* Playbook-applied step: a distinct activity marker (not a tool call) that names
+   the playbook shaping the turn — for both /name and auto-pickup. */
+.playbook-marker {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.playbook-icon-glyph {
+  font-size: 0.95em;
+  line-height: 1;
+  margin-right: 2px;
+}
+.playbook-step .step-label {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
 .success-marker {
   background: var(--accent);
   border-color: var(--accent);

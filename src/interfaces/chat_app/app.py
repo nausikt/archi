@@ -69,10 +69,12 @@ from src.utils.playbook_service import (
 from src.archi.pipelines.agents.tools.playbook_tools import (
     set_playbook_owner, get_playbook_owner,
     set_pending_playbook, get_pending_playbook, clear_pending_playbook,
+    classify_playbook_tool_result,
 )
 from src.interfaces.chat_app.document_utils import *
 from src.interfaces.chat_app.playbook_routes import register_playbooks
 from src.interfaces.chat_app.crab_routes import register_crab_routes
+
 from src.interfaces.chat_app.service_alerts import (
     register_service_alerts, get_active_banner_alerts, is_alert_manager,
 )
@@ -89,7 +91,9 @@ from src.utils.ab_testing import (
     normalize_ab_trace_mode,
     resolve_ab_agents_dir,
 )
-from src.interfaces.chat_app.event_formatter import PipelineEventFormatter
+from src.interfaces.chat_app.event_formatter import (
+    PipelineEventFormatter, build_playbook_applied_events, playbook_loads_from_events,
+)
 from src.utils.conversation_service import ConversationService
 from src.utils.user_service import UserService
 from src.utils.ab_agent_spec_service import ABAgentSpecService, ABAgentSpecRecord
@@ -331,6 +335,22 @@ def _query_convo_history_rows(cursor, conversation_id):
     return cursor.fetchall()
 
 
+def _resolve_auto_playbook_invocation(tc):
+    """Resolve (playbook_id, name, status) for a model-invoked Playbook tool call.
+
+    Prefer the ToolMessage artifact: a successful load carries the resolved id +
+    name (server-side only) and implies status 'ok'. Fall back to classifying the
+    result string when no artifact rode along — every error return path of the tool
+    yields artifact=None. `tc` is one entry from PipelineOutput.extract_tool_calls.
+    """
+    args = tc.get("args") or {}
+    requested = args.get("playbook") if isinstance(args, dict) else None
+    artifact = tc.get("artifact")
+    if isinstance(artifact, dict) and artifact.get("kind") == "playbook":
+        return artifact.get("playbook_id"), artifact.get("playbook_name") or requested, "ok"
+    return None, requested, classify_playbook_tool_result(tc.get("result", ""))
+
+
 class ChatWrapper:
     AUTO_SOURCE_SECTION_LABEL = "Retrieved documents"
     AUTO_SOURCE_SECTION_EXPLANATION = "These are the knowledge-base documents retrieved for this answer."
@@ -346,7 +366,7 @@ class ChatWrapper:
         # Threading lock for database operations
         self.lock = Lock()
         self._agent_refresh_lock = Lock()
-        
+
         # load configs
         self.config = get_full_config()
         self.global_config = self.config["global"]
@@ -636,7 +656,7 @@ class ChatWrapper:
             )
 
         model_name = self._extract_model_name(config_payload)
-        
+
         self.current_config_name = target_config_name
         self.archi.update(pipeline=agent_class, config_name=target_config_name)
 
@@ -959,13 +979,13 @@ class ChatWrapper:
     ) -> str:
         """
         Create a new agent trace record for tracking execution.
-        
+
         Returns:
             The trace_id (UUID string) of the newly created trace
         """
         trace_id = str(uuid.uuid4())
         started_at = datetime.now(timezone.utc)
-        
+
         conn = psycopg2.connect(**self.pg_config)
         cursor = conn.cursor()
         try:
@@ -996,7 +1016,7 @@ class ChatWrapper:
         Update an agent trace with new events and/or status.
         """
         completed_at = datetime.now(timezone.utc) if status in ('completed', 'cancelled', 'error') else None
-        
+
         conn = psycopg2.connect(**self.pg_config)
         cursor = conn.cursor()
         try:
@@ -1015,7 +1035,7 @@ class ChatWrapper:
     def get_agent_trace(self, trace_id: str) -> Optional[Dict[str, Any]]:
         """
         Get an agent trace by ID.
-        
+
         Returns:
             Dict with trace data or None if not found
         """
@@ -1071,7 +1091,7 @@ class ChatWrapper:
     ) -> int:
         """
         Cancel all running traces for a conversation.
-        
+
         Returns:
             Number of traces cancelled
         """
@@ -1140,7 +1160,7 @@ class ChatWrapper:
         service = "Chatbot"
         title = first_message[:20] + ("..." if len(first_message) > 20 else "")
         now = datetime.now(timezone.utc)
-        
+
         version = os.getenv("APP_VERSION", "unknown")
 
         # title, created_at, last_message_at, client_id, version, user_id
@@ -1239,6 +1259,17 @@ class ChatWrapper:
                 message_id, context.playbook_name, context.playbook_id)
         except Exception as exc:
             logger.warning("Could not record playbook turn for message %s: %s", message_id, exc)
+        # Unified ledger: also log this explicit /name use to playbook_invocations
+        # (one honest row per use across both sources). Independent best-effort so a
+        # ledger failure never affects the chip side-table write above. Regenerate
+        # turns are excluded upstream (this runs only when not is_refresh), matching
+        # the side table — a known, deliberate limitation.
+        try:
+            self._playbook_svc().record_invocation(
+                getattr(context, "conversation_id", None), message_id,
+                context.playbook_id, context.playbook_name, source="explicit", status="ok")
+        except Exception as exc:
+            logger.warning("Could not record playbook invocation for message %s: %s", message_id, exc)
 
     def insert_conversation(self, conversation_id, user_message, archi_message, link, archi_context, context:ChatRequestContext, is_refresh=False) -> List[int]:
         """
@@ -1348,12 +1379,15 @@ class ChatWrapper:
 
         insert_tups = []
         step_number = 0
+        auto_invocations = []  # (playbook_id, name, status) for model-invoked Playbook loads
         for tc in tool_calls:
             step_number += 1
             tool_call_id = tc.get("id", "")
             tool_name = tc.get("name", "unknown")
             tool_args = tc.get("args", {})
             tool_result = tc.get("result", "")
+            if tool_name == "Playbook":
+                auto_invocations.append(_resolve_auto_playbook_invocation(tc))
             if len(tool_result) > 500:
                 tool_result = tool_result[:500] + "..."
             ts = tool_call_timestamps.get(tool_call_id, datetime.now(timezone.utc))
@@ -1367,7 +1401,7 @@ class ChatWrapper:
                 tool_result,
                 ts,
             ))
-        
+
         logger.debug("Inserting %d tool calls for message %d", len(insert_tups), message_id)
 
         conn = psycopg2.connect(**self.pg_config)
@@ -1377,6 +1411,16 @@ class ChatWrapper:
 
         cursor.close()
         conn.close()
+
+        # Unified ledger: one auto row per model-invoked Playbook load (best-effort,
+        # after the agent_tool_calls write so a ledger failure can't lose tool rows).
+        for pb_id, pb_name, pb_status in auto_invocations:
+            try:
+                self._playbook_svc().record_invocation(
+                    conversation_id, message_id, pb_id, pb_name, source="auto", status=pb_status)
+            except Exception as exc:
+                logger.warning(
+                    "Could not record auto playbook invocation for message %s: %s", message_id, exc)
 
     def _init_timestamps(self) -> Dict[str, datetime]:
         return {
@@ -1390,12 +1434,12 @@ class ChatWrapper:
     def _create_provider_llm(self, provider: str, model: str, api_key: str = None):
         """
         Create a LangChain chat model using the provider abstraction layer.
-        
+
         Args:
             provider: Provider type (openai, anthropic, gemini, openrouter, local)
             model: Model ID/name to use
             api_key: Optional API key (overrides environment variable)
-        
+
         Returns:
             A LangChain BaseChatModel instance, or None if creation fails
         """
@@ -1666,7 +1710,7 @@ class ChatWrapper:
     @staticmethod
     def _trace_from_row(row) -> Dict[str, Any]:
         """Convert a positional agent trace DB row to a dict.
-        
+
         Handles both full rows (16 fields) and subset rows (9 fields from get_active_trace).
         """
         result = {
@@ -1743,273 +1787,301 @@ class ChatWrapper:
             yield {"type": "error", "message": "A/B pool not configured"}
             return
 
-        requested_config = self._resolve_config_name(config_name)
-        self.update_config(config_name=requested_config)
-
-        # Sample matchup
-        arm_a_variant, arm_b_variant, is_champion_first = self.ab_pool.sample_matchup()
-        logger.info(
-            "A/B matchup: arm_a='%s' arm_b='%s' champion_first=%s",
-            arm_a_variant.name, arm_b_variant.name, is_champion_first,
-        )
-
-        # Prepare chat context (shared — same user message for both arms)
-        timestamps = self._init_timestamps()
-        context, error_code = self._prepare_chat_context(
-            message,
-            conversation_id,
-            client_id,
-            is_refresh,
-            server_received_msg_ts,
-            client_sent_msg_ts,
-            client_timeout,
-            timestamps,
-            config_name,
-            user_id=user_id,
-        )
-        if error_code is not None:
-            yield self._error_event(error_code)
-            return
-
-        # G2 (Layer 2): the owner ContextVar is set on this request thread by
-        # _stage_playbook_for_request; capture it so each arm thread can re-establish it.
-        # A bare threading.Thread does NOT inherit ContextVars.
-        _playbook_owner = get_playbook_owner()
-
-        # Build variant archis
         try:
-            arm_a_variant, arm_a_agent_spec = self._resolve_runtime_ab_variant(arm_a_variant)
-            arm_b_variant, arm_b_agent_spec = self._resolve_runtime_ab_variant(arm_b_variant)
-            archi_a = self._create_variant_archi(
-                arm_a_variant,
-                variant_agent_spec=arm_a_agent_spec,
-                request_provider=provider,
-                request_model=model,
-                request_provider_api_key=provider_api_key,
+            requested_config = self._resolve_config_name(config_name)
+            self.update_config(config_name=requested_config)
+
+            # Sample matchup
+            arm_a_variant, arm_b_variant, is_champion_first = self.ab_pool.sample_matchup()
+            logger.info(
+                "A/B matchup: arm_a='%s' arm_b='%s' champion_first=%s",
+                arm_a_variant.name, arm_b_variant.name, is_champion_first,
             )
-            archi_b = self._create_variant_archi(
-                arm_b_variant,
-                variant_agent_spec=arm_b_agent_spec,
-                request_provider=provider,
-                request_model=model,
-                request_provider_api_key=provider_api_key,
+
+            # Prepare chat context (shared — same user message for both arms)
+            timestamps = self._init_timestamps()
+            context, error_code = self._prepare_chat_context(
+                message,
+                conversation_id,
+                client_id,
+                is_refresh,
+                server_received_msg_ts,
+                client_sent_msg_ts,
+                client_timeout,
+                timestamps,
+                config_name,
+                user_id=user_id,
             )
-        except Exception as exc:
-            logger.error("Failed to create variant pipelines: %s", exc)
-            yield {"type": "error", "message": f"Failed to initialise A/B variants: {exc}"}
-            return
+            if error_code is not None:
+                yield self._error_event(error_code)
+                return
 
-        # Shared queue for real-time interleaving
-        event_queue: queue.Queue = queue.Queue()
-        _SENTINEL = object()
+            # A /name-invoked playbook has no in-arm Playbook tool call to surface, and the
+            # A/B client drops any event lacking an `arm` tag — so emit the applied-playbook
+            # step once per arm here (each flows through the arm-tagged client path into its
+            # own timeline; renderPlaybookApplied dedupes if an arm later re-loads it).
+            for _pb_event in build_playbook_applied_events(get_pending_playbook(), ("a", "b")):
+                yield _pb_event
 
-        # Track final text per arm (mutated by threads).
-        # Thread-safety note: each thread writes to its own key ("a" or "b")
-        # which is safe under CPython's GIL.  The "final_text" value relies on
-        # PipelineEventFormatter yielding *accumulated* content (not deltas);
-        # the last write per arm is therefore the complete response text.
-        arm_results = {
-            "a": {
-                "final_text": "",
-                "error": None,
-                "final_emitted": False,
-                "duration_ms": None,
-            },
-            "b": {
-                "final_text": "",
-                "error": None,
-                "final_emitted": False,
-                "duration_ms": None,
-            },
-        }
-        arm_model_used = {
-            "a": f"{arm_a_variant.provider or ''}/{arm_a_variant.model or ''}".strip("/"),
-            "b": f"{arm_b_variant.provider or ''}/{arm_b_variant.model or ''}".strip("/"),
-        }
+            # G2 (Layer 2): the owner ContextVar is set on this request thread by
+            # _stage_playbook_for_request; capture it so each arm thread can re-establish it.
+            # A bare threading.Thread does NOT inherit ContextVars.
+            _playbook_owner = get_playbook_owner()
 
-        def _stream_arm(arm_archi, arm_label):
-            """Run one arm's stream in a thread, pushing events to the shared queue."""
-            set_playbook_owner(_playbook_owner)  # G2: ContextVars don't cross the thread boundary
-            import time as _time
-            formatter = PipelineEventFormatter(message_content_fn=self._message_content)
-            t0 = _time.monotonic()
-            first_event_logged = False
+            # Build variant archis
             try:
-                logger.info("A/B arm '%s' thread started (t+0.0s)", arm_label)
-                vs = self.archi.vs_connector.get_vectorstore()
-                logger.info(
-                    "A/B arm '%s' vectorstore ready (t+%.1fs)",
-                    arm_label, _time.monotonic() - t0,
+                arm_a_variant, arm_a_agent_spec = self._resolve_runtime_ab_variant(arm_a_variant)
+                arm_b_variant, arm_b_agent_spec = self._resolve_runtime_ab_variant(arm_b_variant)
+                archi_a = self._create_variant_archi(
+                    arm_a_variant,
+                    variant_agent_spec=arm_a_agent_spec,
+                    request_provider=provider,
+                    request_model=model,
+                    request_provider_api_key=provider_api_key,
                 )
-                for output in arm_archi.pipeline.stream(
-                    history=context.history,
-                    conversation_id=context.conversation_id,
-                    vectorstore=vs,
-                ):
-                    output_meta = output.metadata or {}
-                    for event in formatter.process(output):
-                        if not first_event_logged:
-                            logger.info(
-                                "A/B arm '%s' first event (t+%.1fs): type=%s",
-                                arm_label, _time.monotonic() - t0, event.get("type"),
-                            )
-                            first_event_logged = True
-                        event["arm"] = arm_label
-                        if event["type"] == "text":
-                            arm_results[arm_label]["final_text"] = event["content"]
-                        event_queue.put(event)
-                    if output_meta.get("event_type") == "final" and not arm_results[arm_label]["final_emitted"]:
-                        if not first_event_logged:
-                            logger.info(
-                                "A/B arm '%s' first event (t+%.1fs): type=final",
-                                arm_label, _time.monotonic() - t0,
-                            )
-                            first_event_logged = True
-                        final_text = getattr(output, "answer", "") or formatter.last_text or arm_results[arm_label]["final_text"]
-                        arm_results[arm_label]["final_text"] = final_text
-                        arm_results[arm_label]["final_emitted"] = True
-                        duration_ms = int((_time.monotonic() - t0) * 1000)
-                        arm_results[arm_label]["duration_ms"] = duration_ms
-                        event_queue.put({
-                            "type": "final",
-                            "arm": arm_label,
-                            "response": final_text,
-                            "usage": output_meta.get("usage"),
-                            "model": output_meta.get("model"),
-                            "model_used": arm_model_used[arm_label],
-                            "duration_ms": duration_ms,
-                        })
-            except Exception as exc:
-                arm_results[arm_label]["error"] = str(exc)
-                event_queue.put({"type": "error", "arm": arm_label, "message": str(exc)})
-            finally:
-                logger.info(
-                    "A/B arm '%s' finished (t+%.1fs)",
-                    arm_label, _time.monotonic() - t0,
-                )
-                event_queue.put(_SENTINEL)
-
-        # Yield arm labels early so the frontend can display variant names
-        yield {
-            "type": "ab_arms",
-            "arm_a_name": arm_a_variant.name,
-            "arm_b_name": arm_b_variant.name,
-            "variant_label_mode": self.ab_pool.variant_label_mode,
-        }
-
-        # Start both arms in parallel threads
-        thread_a = threading.Thread(target=_stream_arm, args=(archi_a, "a"), daemon=True)
-        thread_b = threading.Thread(target=_stream_arm, args=(archi_b, "b"), daemon=True)
-        thread_a.start()
-        thread_b.start()
-
-        # Drain the queue in real-time, yielding events as they arrive
-        finished_count = 0
-        while finished_count < 2:
-            item = event_queue.get()
-            if item is _SENTINEL:
-                finished_count += 1
-                continue
-            yield item
-
-        thread_a.join()
-        thread_b.join()
-
-        # Check for errors
-        arm_a_error = arm_results["a"]["error"]
-        arm_b_error = arm_results["b"]["error"]
-        arm_a_final_text = arm_results["a"]["final_text"]
-        arm_b_final_text = arm_results["b"]["final_text"]
-        arm_a_duration_ms = arm_results["a"]["duration_ms"]
-        arm_b_duration_ms = arm_results["b"]["duration_ms"]
-
-        if arm_a_error and arm_b_error:
-            yield {"type": "error", "message": "Both A/B arms failed",
-                   "arm_a_error": arm_a_error, "arm_b_error": arm_b_error}
-            return
-
-        if arm_a_error or arm_b_error:
-            yield {"type": "error", "message": "One A/B arm failed",
-                   "failed_arm": "a" if arm_a_error else "b",
-                   "error": arm_a_error or arm_b_error}
-            return
-
-        # Store user message first (normal chat stores it inline, AB must do so explicitly)
-        user_prompt_mid = None
-        if not is_refresh:
-            try:
-                insert_tups = [
-                    ("chat", context.conversation_id, context.sender, context.content,
-                     "", "", datetime.now(), None, None),
-                ]
-                inserted_ids = self._insert_conversation_rows(insert_tups)
-                user_prompt_mid = inserted_ids[0] if inserted_ids else None
-                self._record_playbook_turn_best_effort(user_prompt_mid, context)
-            except Exception as exc:
-                logger.error("Failed to store user message: %s", exc)
-
-        # Store both responses as messages
-        pipeline_used = ChatWrapper._get_agent_class_from_cfg(self.services_config.get("chat_app", {})) or ""
-        arm_a_mid = self._store_assistant_message(
-            context.conversation_id,
-            arm_a_final_text,
-            model_used=f"{arm_a_variant.provider or ''}/{arm_a_variant.model or ''}".strip("/"),
-            pipeline_used=pipeline_used,
-        )
-        arm_b_mid = self._store_assistant_message(
-            context.conversation_id,
-            arm_b_final_text,
-            model_used=f"{arm_b_variant.provider or ''}/{arm_b_variant.model or ''}".strip("/"),
-            pipeline_used=pipeline_used,
-        )
-
-        # Persist per-arm latency for analysis by reusing the timing table keyed by message_id.
-        self._persist_ab_arm_timing(arm_a_mid, arm_a_duration_ms)
-        self._persist_ab_arm_timing(arm_b_mid, arm_b_duration_ms)
-
-        # Get user prompt message ID if not already stored above
-        if not user_prompt_mid:
-            user_prompt_mid = self._get_last_user_message_id(context.conversation_id)
-
-        # Create comparison record (skip if we have no valid message IDs)
-        comparison_id = None
-        if user_prompt_mid and arm_a_mid and arm_b_mid:
-            try:
-                comparison_id = self.conv_service.create_ab_comparison(
-                    conversation_id=context.conversation_id,
-                    user_prompt_mid=user_prompt_mid,
-                    response_a_mid=arm_a_mid,
-                    response_b_mid=arm_b_mid,
-                    model_a=f"{arm_a_variant.provider or ''}/{arm_a_variant.model or ''}".strip("/"),
-                    pipeline_a=pipeline_used,
-                    model_b=f"{arm_b_variant.provider or ''}/{arm_b_variant.model or ''}".strip("/"),
-                    pipeline_b=pipeline_used,
-                    is_config_a_first=is_champion_first,
-                    variant_a_name=arm_a_variant.name,
-                    variant_b_name=arm_b_variant.name,
-                    variant_a_meta=arm_a_variant.to_meta_json(),
-                    variant_b_meta=arm_b_variant.to_meta_json(),
+                archi_b = self._create_variant_archi(
+                    arm_b_variant,
+                    variant_agent_spec=arm_b_agent_spec,
+                    request_provider=provider,
+                    request_model=model,
+                    request_provider_api_key=provider_api_key,
                 )
             except Exception as exc:
-                logger.error("Failed to create A/B comparison record: %s", exc)
-                comparison_id = None
+                logger.error("Failed to create variant pipelines: %s", exc)
+                yield {"type": "error", "message": f"Failed to initialise A/B variants: {exc}"}
+                return
 
-        # Emit final metadata event
-        yield {
-            "type": "ab_meta",
-            "comparison_id": comparison_id,
-            "conversation_id": context.conversation_id,
-            "arm_a_variant": arm_a_variant.name,
-            "arm_b_variant": arm_b_variant.name,
-            "arm_a_model_used": f"{arm_a_variant.provider or ''}/{arm_a_variant.model or ''}".strip("/"),
-            "arm_b_model_used": f"{arm_b_variant.provider or ''}/{arm_b_variant.model or ''}".strip("/"),
-            "is_champion_first": is_champion_first,
-            "arm_a_message_id": arm_a_mid,
-            "arm_b_message_id": arm_b_mid,
-            "arm_a_duration_ms": arm_a_duration_ms,
-            "arm_b_duration_ms": arm_b_duration_ms,
-            "variant_label_mode": self.ab_pool.variant_label_mode,
-        }
+            # Shared queue for real-time interleaving
+            event_queue: queue.Queue = queue.Queue()
+            _SENTINEL = object()
+
+            # Track final text per arm (mutated by threads).
+            # Thread-safety note: each thread writes to its own key ("a" or "b")
+            # which is safe under CPython's GIL.  The "final_text" value relies on
+            # PipelineEventFormatter yielding *accumulated* content (not deltas);
+            # the last write per arm is therefore the complete response text.
+            arm_results = {
+                "a": {
+                    "final_text": "",
+                    "error": None,
+                    "final_emitted": False,
+                    "duration_ms": None,
+                    "playbook_events": [],  # in-arm playbook_applied events (auto loads)
+                },
+                "b": {
+                    "final_text": "",
+                    "error": None,
+                    "final_emitted": False,
+                    "duration_ms": None,
+                    "playbook_events": [],
+                },
+            }
+            arm_model_used = {
+                "a": f"{arm_a_variant.provider or ''}/{arm_a_variant.model or ''}".strip("/"),
+                "b": f"{arm_b_variant.provider or ''}/{arm_b_variant.model or ''}".strip("/"),
+            }
+
+            def _stream_arm(arm_archi, arm_label):
+                """Run one arm's stream in a thread, pushing events to the shared queue."""
+                set_playbook_owner(_playbook_owner)  # G2: ContextVars don't cross the thread boundary
+                import time as _time
+                formatter = PipelineEventFormatter(message_content_fn=self._message_content)
+                t0 = _time.monotonic()
+                first_event_logged = False
+                try:
+                    logger.info("A/B arm '%s' thread started (t+0.0s)", arm_label)
+                    vs = self.archi.vs_connector.get_vectorstore()
+                    logger.info(
+                        "A/B arm '%s' vectorstore ready (t+%.1fs)",
+                        arm_label, _time.monotonic() - t0,
+                    )
+                    for output in arm_archi.pipeline.stream(
+                        history=context.history,
+                        conversation_id=context.conversation_id,
+                        vectorstore=vs,
+                    ):
+                        output_meta = output.metadata or {}
+                        for event in formatter.process(output):
+                            if not first_event_logged:
+                                logger.info(
+                                    "A/B arm '%s' first event (t+%.1fs): type=%s",
+                                    arm_label, _time.monotonic() - t0, event.get("type"),
+                                )
+                                first_event_logged = True
+                            event["arm"] = arm_label
+                            if event["type"] == "text":
+                                arm_results[arm_label]["final_text"] = event["content"]
+                            elif event["type"] == "playbook_applied":
+                                # Collected for the unified ledger; filtered to in-arm auto
+                                # loads (tool_call_id-bearing) after the arm's message id is known.
+                                arm_results[arm_label]["playbook_events"].append(event)
+                            event_queue.put(event)
+                        if output_meta.get("event_type") == "final" and not arm_results[arm_label]["final_emitted"]:
+                            if not first_event_logged:
+                                logger.info(
+                                    "A/B arm '%s' first event (t+%.1fs): type=final",
+                                    arm_label, _time.monotonic() - t0,
+                                )
+                                first_event_logged = True
+                            final_text = getattr(output, "answer", "") or formatter.last_text or arm_results[arm_label]["final_text"]
+                            arm_results[arm_label]["final_text"] = final_text
+                            arm_results[arm_label]["final_emitted"] = True
+                            duration_ms = int((_time.monotonic() - t0) * 1000)
+                            arm_results[arm_label]["duration_ms"] = duration_ms
+                            event_queue.put({
+                                "type": "final",
+                                "arm": arm_label,
+                                "response": final_text,
+                                "usage": output_meta.get("usage"),
+                                "model": output_meta.get("model"),
+                                "model_used": arm_model_used[arm_label],
+                                "duration_ms": duration_ms,
+                            })
+                except Exception as exc:
+                    arm_results[arm_label]["error"] = str(exc)
+                    event_queue.put({"type": "error", "arm": arm_label, "message": str(exc)})
+                finally:
+                    logger.info(
+                        "A/B arm '%s' finished (t+%.1fs)",
+                        arm_label, _time.monotonic() - t0,
+                    )
+                    event_queue.put(_SENTINEL)
+
+            # Yield arm labels early so the frontend can display variant names
+            yield {
+                "type": "ab_arms",
+                "arm_a_name": arm_a_variant.name,
+                "arm_b_name": arm_b_variant.name,
+                "variant_label_mode": self.ab_pool.variant_label_mode,
+            }
+
+            # Start both arms in parallel threads
+            thread_a = threading.Thread(target=_stream_arm, args=(archi_a, "a"), daemon=True)
+            thread_b = threading.Thread(target=_stream_arm, args=(archi_b, "b"), daemon=True)
+            thread_a.start()
+            thread_b.start()
+
+            # Drain the queue in real-time, yielding events as they arrive
+            finished_count = 0
+            while finished_count < 2:
+                item = event_queue.get()
+                if item is _SENTINEL:
+                    finished_count += 1
+                    continue
+                yield item
+
+            thread_a.join()
+            thread_b.join()
+
+            # Check for errors
+            arm_a_error = arm_results["a"]["error"]
+            arm_b_error = arm_results["b"]["error"]
+            arm_a_final_text = arm_results["a"]["final_text"]
+            arm_b_final_text = arm_results["b"]["final_text"]
+            arm_a_duration_ms = arm_results["a"]["duration_ms"]
+            arm_b_duration_ms = arm_results["b"]["duration_ms"]
+
+            if arm_a_error and arm_b_error:
+                yield {"type": "error", "message": "Both A/B arms failed",
+                       "arm_a_error": arm_a_error, "arm_b_error": arm_b_error}
+                return
+
+            if arm_a_error or arm_b_error:
+                yield {"type": "error", "message": "One A/B arm failed",
+                       "failed_arm": "a" if arm_a_error else "b",
+                       "error": arm_a_error or arm_b_error}
+                return
+
+            # Store user message first (normal chat stores it inline, AB must do so explicitly)
+            user_prompt_mid = None
+            if not is_refresh:
+                try:
+                    insert_tups = [
+                        ("chat", context.conversation_id, context.sender, context.content,
+                         "", "", datetime.now(), None, None),
+                    ]
+                    inserted_ids = self._insert_conversation_rows(insert_tups)
+                    user_prompt_mid = inserted_ids[0] if inserted_ids else None
+                    self._record_playbook_turn_best_effort(user_prompt_mid, context)
+                except Exception as exc:
+                    logger.error("Failed to store user message: %s", exc)
+
+            # Store both responses as messages
+            pipeline_used = ChatWrapper._get_agent_class_from_cfg(self.services_config.get("chat_app", {})) or ""
+            arm_a_mid = self._store_assistant_message(
+                context.conversation_id,
+                arm_a_final_text,
+                model_used=f"{arm_a_variant.provider or ''}/{arm_a_variant.model or ''}".strip("/"),
+                pipeline_used=pipeline_used,
+            )
+            arm_b_mid = self._store_assistant_message(
+                context.conversation_id,
+                arm_b_final_text,
+                model_used=f"{arm_b_variant.provider or ''}/{arm_b_variant.model or ''}".strip("/"),
+                pipeline_used=pipeline_used,
+            )
+
+            # Persist per-arm latency for analysis by reusing the timing table keyed by message_id.
+            self._persist_ab_arm_timing(arm_a_mid, arm_a_duration_ms)
+            self._persist_ab_arm_timing(arm_b_mid, arm_b_duration_ms)
+
+            # Unified ledger: one auto row per in-arm model-invoked Playbook load, keyed to
+            # that arm's assistant message. The up-front /name per-arm events carry no
+            # tool_call_id and were already logged as explicit via the shared turn-recorder;
+            # they are skipped here. Failed in-arm loads produce no artifact hence no event —
+            # an accepted v1 limitation.
+            self._record_ab_playbook_loads(
+                context.conversation_id, arm_a_mid, "a", arm_results["a"]["playbook_events"])
+            self._record_ab_playbook_loads(
+                context.conversation_id, arm_b_mid, "b", arm_results["b"]["playbook_events"])
+
+            # Get user prompt message ID if not already stored above
+            if not user_prompt_mid:
+                user_prompt_mid = self._get_last_user_message_id(context.conversation_id)
+
+            # Create comparison record (skip if we have no valid message IDs)
+            comparison_id = None
+            if user_prompt_mid and arm_a_mid and arm_b_mid:
+                try:
+                    comparison_id = self.conv_service.create_ab_comparison(
+                        conversation_id=context.conversation_id,
+                        user_prompt_mid=user_prompt_mid,
+                        response_a_mid=arm_a_mid,
+                        response_b_mid=arm_b_mid,
+                        model_a=f"{arm_a_variant.provider or ''}/{arm_a_variant.model or ''}".strip("/"),
+                        pipeline_a=pipeline_used,
+                        model_b=f"{arm_b_variant.provider or ''}/{arm_b_variant.model or ''}".strip("/"),
+                        pipeline_b=pipeline_used,
+                        is_config_a_first=is_champion_first,
+                        variant_a_name=arm_a_variant.name,
+                        variant_b_name=arm_b_variant.name,
+                        variant_a_meta=arm_a_variant.to_meta_json(),
+                        variant_b_meta=arm_b_variant.to_meta_json(),
+                    )
+                except Exception as exc:
+                    logger.error("Failed to create A/B comparison record: %s", exc)
+                    comparison_id = None
+
+            # Emit final metadata event
+            yield {
+                "type": "ab_meta",
+                "comparison_id": comparison_id,
+                "conversation_id": context.conversation_id,
+                "arm_a_variant": arm_a_variant.name,
+                "arm_b_variant": arm_b_variant.name,
+                "arm_a_model_used": f"{arm_a_variant.provider or ''}/{arm_a_variant.model or ''}".strip("/"),
+                "arm_b_model_used": f"{arm_b_variant.provider or ''}/{arm_b_variant.model or ''}".strip("/"),
+                "is_champion_first": is_champion_first,
+                "arm_a_message_id": arm_a_mid,
+                "arm_b_message_id": arm_b_mid,
+                "arm_a_duration_ms": arm_a_duration_ms,
+                "arm_b_duration_ms": arm_b_duration_ms,
+                "variant_label_mode": self.ab_pool.variant_label_mode,
+            }
+        except Exception:
+            logger.error("A/B comparison failed", exc_info=True)
+            yield {"type": "error", "message": "A/B comparison failed; see chat logs for details"}
+            return
 
     def _store_assistant_message(self, conversation_id, content, model_used=None, pipeline_used=None):
         """Store an assistant message and return the message_id."""
@@ -2021,6 +2093,46 @@ class ChatWrapper:
         except Exception as exc:
             logger.error("Failed to store assistant message: %s", exc)
             return None
+
+    def _record_ab_playbook_loads(self, conversation_id, message_id, arm, events) -> None:
+        """Best-effort unified-ledger write for one A/B arm's in-arm auto Playbook
+        loads (the arm-tagged playbook_applied events that carry a tool_call_id).
+        No-op without a stored arm message id. Never breaks the comparison."""
+        if not message_id:
+            return
+        for load in playbook_loads_from_events(events):
+            try:
+                self._playbook_svc().record_invocation(
+                    conversation_id, message_id, load.get("playbook_id"), load.get("name"),
+                    source="auto", status="ok", arm=arm)
+            except Exception as exc:
+                logger.warning(
+                    "Could not record A/B auto playbook invocation (arm %s): %s", arm, exc)
+
+    def _record_stream_playbook_loads(
+            self, conversation_id, archi_message_id, trace_events, recorded_ids) -> None:
+        """Best-effort unified-ledger write for the stream path's in-turn auto Playbook
+        loads. The stream finalizes on the LAST streamed PipelineOutput, whose .messages
+        hold only the final answer — so insert_tool_calls_from_output extracts nothing and
+        the auto ledger would miss stream-turn loads. Recover them from the persisted trace
+        events (playbook_applied events carry tool_call_id/name/playbook_id), skipping any
+        id already written as an auto row for this turn (``recorded_ids`` — non-empty only
+        for pipelines whose final output DOES carry full messages) so nothing is
+        double-counted. No-op without a stored archi message id or any events; never breaks
+        the stream."""
+        if not (archi_message_id and trace_events):
+            return
+        for load in playbook_loads_from_events(trace_events):
+            if load.get("tool_call_id") in recorded_ids:
+                continue
+            try:
+                self._playbook_svc().record_invocation(
+                    conversation_id, archi_message_id, load.get("playbook_id"), load.get("name"),
+                    source="auto", status="ok")
+            except Exception as exc:
+                logger.warning(
+                    "Could not record stream auto playbook invocation for message %s: %s",
+                    archi_message_id, exc)
 
     def _persist_ab_arm_timing(self, message_id: Optional[int], duration_ms: Optional[int]) -> None:
         """Persist A/B arm latency into the timing table for post-hoc analysis."""
@@ -2160,7 +2272,7 @@ class ChatWrapper:
         documents = result.get("source_documents", [])
         scores = result.get("metadata", {}).get("retriever_scores", [])
         top_sources = self.get_top_sources(documents, scores)
-        
+
         output = self.append_source_section(
             output,
             top_sources,
@@ -2319,10 +2431,10 @@ class ChatWrapper:
             if error_code is not None:
                 yield self._error_event(error_code)
                 return
-            
+
             requested_config = self._resolve_config_name(config_name)
             self.update_config(config_name=requested_config)
-            
+
             pipeline = getattr(self.archi, "pipeline", None)
             build_user_tools = getattr(pipeline, "build_user_scoped_mcp_tools", None)
 
@@ -2384,7 +2496,7 @@ class ChatWrapper:
                 except Exception as e:
                     logger.warning(f"Failed to create provider LLM {provider}/{model}: {e}")
                     yield {"type": "warning", "message": f"Using default model: {e}"}
-            
+
             # Create trace for this streaming request
             trace_id = self.create_agent_trace(
                 conversation_id=context.conversation_id,
@@ -2408,7 +2520,7 @@ class ChatWrapper:
                     yield self._error_event(408)
                     return
                 last_output = output
-                
+
                 # Use shared event formatter for structured event types
                 event_type = output.metadata.get("event_type", "text") if output.metadata else "text"
                 timestamp = datetime.now(timezone.utc).isoformat()
@@ -2481,7 +2593,7 @@ class ChatWrapper:
                     )
                 yield {"type": "error", "status": 500, "message": "server error; see chat logs for message"}
                 return
-                
+
             # keep track of total number of queries and log this amount
             self.number_of_queries += 1
             logger.info(f"Number of queries is: {self.number_of_queries}")
@@ -2494,6 +2606,16 @@ class ChatWrapper:
                 render_markdown=False,  # Client renders with marked.js
             )
 
+            # Stream path only: _finalize_result ran insert_tool_calls_from_output on the
+            # LAST streamed output, whose .messages hold only the final answer — so auto
+            # Playbook loads that happened mid-stream never reached the unified ledger.
+            # Recover them from the trace events, skipping any tool-call id the finalize
+            # already wrote (dedupe for pipelines whose final output does carry messages).
+            if message_ids:
+                recorded_ids = {tc.get("id") for tc in last_output.extract_tool_calls()}
+                self._record_stream_playbook_loads(
+                    context.conversation_id, message_ids[-1], trace_events, recorded_ids)
+
             timestamps["finish_call_ts"] = datetime.now(timezone.utc)
             timestamps["server_received_msg_ts"] = server_received_msg_ts
             timestamps["client_sent_msg_ts"] = datetime.fromtimestamp(client_sent_msg_ts, tz=timezone.utc)
@@ -2501,17 +2623,17 @@ class ChatWrapper:
 
             if message_ids:
                 self.insert_timing(message_ids[-1], timestamps)
-                
+
             # Calculate total duration
             total_duration_ms = int((time.time() - stream_start_time) * 1000)
-            
+
             # Extract usage and model from final output metadata
             usage = None
             model = None
             if last_output and last_output.metadata:
                 usage = last_output.metadata.get("usage")
                 model = last_output.metadata.get("model")
-            
+
             # Append usage summary to trace events so it's available in historical views
             if usage:
                 trace_events.append({
@@ -2612,14 +2734,14 @@ class FlaskAppWrapper(object):
         self.app.secret_key = read_or_create_persistent_secret(
             "FLASK_UPLOADER_APP_SECRET_KEY", self.data_path
         )
-        
+
         # Session cookie security settings (BYOK security hardening)
         self.app.config['SESSION_COOKIE_HTTPONLY'] = True  # Prevent JavaScript access
         self.app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # CSRF protection
         # SESSION_COOKIE_SECURE should be True in production (HTTPS only)
         # Leave it False for local development to work over HTTP
         self.app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB upload limit
-        
+
         self.app.config['ACCOUNTS_FOLDER'] = self.global_config["ACCOUNTS_PATH"]
         os.makedirs(self.app.config['ACCOUNTS_FOLDER'], exist_ok=True)
 
@@ -2657,9 +2779,9 @@ class FlaskAppWrapper(object):
         self.auth_enabled = auth_config.get('enabled', False)
         self.sso_enabled = auth_config.get('sso', {}).get('enabled', False)
         self.basic_auth_enabled = auth_config.get('basic', {}).get('enabled', False)
-        
+
         logger.info(f"Auth enabled: {self.auth_enabled}, SSO: {self.sso_enabled}, Basic: {self.basic_auth_enabled}")
-        
+
         if self.sso_enabled:
             self._setup_sso()
 
@@ -2691,7 +2813,7 @@ class FlaskAppWrapper(object):
         # Public endpoints (no auth required)
         self.add_endpoint('/', 'landing', self.landing)
         self.add_endpoint('/api/health', 'health', self.health, methods=["GET"])
-        
+
         # Protected endpoints (require auth when enabled)
         self.add_endpoint('/chat', 'index', self.require_auth(self.index))
         self.add_endpoint('/api/get_chat_response', 'get_chat_response', self.require_auth(self.get_chat_response), methods=["POST"])
@@ -2835,7 +2957,7 @@ class FlaskAppWrapper(object):
             self.add_endpoint('/api/permissions', 'get_permissions', self.get_permissions, methods=['GET'])
             self.add_endpoint('/api/permissions/check', 'check_permission', self.check_permission_endpoint, methods=['POST'])
 
-            
+
             if self.sso_enabled:
                 self.add_endpoint('/redirect', 'sso_callback', self.sso_callback)
 
@@ -2897,24 +3019,24 @@ class FlaskAppWrapper(object):
         """Initialize OAuth client for SSO using OpenID Connect"""
         auth_config = self.chat_app_config.get('auth', {})
         sso_config = auth_config.get('sso', {})
-        
+
         # Read client credentials from environment
         client_id = read_secret('SSO_CLIENT_ID')
         client_secret = read_secret('SSO_CLIENT_SECRET')
-        
+
         if not client_id or not client_secret:
             logger.error("SSO is enabled but SSO_CLIENT_ID or SSO_CLIENT_SECRET environment variables are not set")
             self.sso_enabled = False
             return
-        
+
         # Initialize OAuth
         self.oauth = OAuth(self.app)
-        
+
         # Get server metadata URL and client kwargs from config
         server_metadata_url = sso_config.get('server_metadata_url', '')
         authorize_url = sso_config.get('authorize_url', None)
         client_kwargs = sso_config.get('client_kwargs', {'scope': 'openid profile email'})
-        
+
         # Register the OAuth provider
         self.oauth.register(
             name='sso',
@@ -2924,7 +3046,7 @@ class FlaskAppWrapper(object):
             authorize_url=authorize_url,
             client_kwargs=client_kwargs
         )
-        
+
         logger.info(f"SSO configured with server: {server_metadata_url}")
 
     def login(self):
@@ -2932,7 +3054,7 @@ class FlaskAppWrapper(object):
         # If user is already logged in, redirect to index
         if session.get('logged_in'):
             return redirect(url_for('index'))
-        
+
         # Handle SSO login initiation
         if request.args.get('method') == 'sso' and self.sso_enabled:
             if not self.oauth:
@@ -2940,12 +3062,12 @@ class FlaskAppWrapper(object):
             redirect_uri = url_for('sso_callback', _external=True)
             logger.info(f"Initiating SSO login with redirect URI: {redirect_uri}")
             return self.oauth.sso.authorize_redirect(redirect_uri)
-        
+
         # Handle basic auth login form submission
         if request.method == 'POST' and self.basic_auth_enabled:
             username = request.form.get('username')
             password = request.form.get('password')
-            
+
             if check_credentials(username, password, self.salt, self.app.config['ACCOUNTS_FOLDER']):
                 self._set_user_session(
                     email=username,
@@ -2958,10 +3080,10 @@ class FlaskAppWrapper(object):
                 return redirect(url_for('index'))
             else:
                 flash('Invalid credentials')
-        
+
         # Render login page with available auth methods
-        return render_template('login.html', 
-                             sso_enabled=self.sso_enabled, 
+        return render_template('login.html',
+                             sso_enabled=self.sso_enabled,
                              basic_auth_enabled=self.basic_auth_enabled)
 
     def logout(self):
@@ -2969,7 +3091,7 @@ class FlaskAppWrapper(object):
         auth_method = session.get('auth_method', 'unknown')
         user_email = self._get_session_user_email() or 'unknown'
         user_roles = session.get('roles', [])
-        
+
         # Clear all session data including roles
         session.pop('user', None)
         session.pop('logged_in', None)
@@ -2981,7 +3103,7 @@ class FlaskAppWrapper(object):
                 self.token_service.revoke_session(sso_sid=sso_sid)
             except Exception as te:
                 logger.warning("Failed to revoke SSO token on logout: %s", te)
-        
+
         # Log logout event
         log_authentication_event(
             user=user_email,
@@ -2990,7 +3112,7 @@ class FlaskAppWrapper(object):
             method=auth_method,
             details=f"Previous roles: {user_roles}"
         )
-        
+
         logger.info(f"User {user_email} logged out (method: {auth_method})")
         flash('You have been logged out successfully')
         return redirect(url_for('landing'))
@@ -2999,23 +3121,23 @@ class FlaskAppWrapper(object):
         """Handle OAuth callback from SSO provider with RBAC role extraction"""
         if not self.sso_enabled or not self.oauth:
             return jsonify({'error': 'SSO not enabled'}), 400
-        
+
         try:
             # Get the token from the callback
             token = self.oauth.sso.authorize_access_token()
-            
+
             # Parse the user info from the token
             user_info = token.get('userinfo')
             if not user_info:
                 # If userinfo is not in token, fetch it
                 user_info = self.oauth.sso.userinfo(token=token)
-            
+
             user_email = user_info.get('email', user_info.get('preferred_username', 'unknown'))
-            
+
             # Extract roles from JWT token using RBAC module
             # This handles role validation and default role assignment
             user_roles = get_user_roles(token, user_email)
-            
+
             # Upsert the SSO user into the users table so that conversation_metadata
             # can reference user_id via the FK constraint.
             sso_user_id = user_info.get('sub', '')
@@ -3033,7 +3155,7 @@ class FlaskAppWrapper(object):
                     user_service.record_login(sso_user_id)
                 except Exception as ue:
                     logger.warning(f"Failed to upsert SSO user {sso_user_id} into users table: {ue}")
-            
+
             if self._forward_sso_enabled and token.get('access_token') and self.token_service.enabled:
                 try:
                     sso_sid = TokenService.mint_sso_sid()
@@ -3064,7 +3186,7 @@ class FlaskAppWrapper(object):
                 auth_method='sso',
                 roles=user_roles
             )
-            
+
             # Log successful authentication
             log_authentication_event(
                 user=user_email,
@@ -3073,12 +3195,12 @@ class FlaskAppWrapper(object):
                 method='sso',
                 details=f"Roles: {user_roles}"
             )
-            
+
             logger.info(f"SSO login successful for user: {user_email} with roles: {user_roles}")
-            
+
             # Redirect to main page
             return redirect(url_for('index'))
-            
+
         except Exception as e:
             logger.error(f"SSO callback error: {str(e)}")
             log_authentication_event(
@@ -3146,10 +3268,10 @@ class FlaskAppWrapper(object):
         if session.get('logged_in'):
             user = session.get('user', {})
             roles = session.get('roles', [])
-            
+
             # Get permission context for the frontend
             permissions = get_permission_context()
-            
+
             return jsonify({
                 'logged_in': True,
                 'email': user.get('email', ''),
@@ -3283,13 +3405,13 @@ class FlaskAppWrapper(object):
     def require_perm(self, permission: str):
         """
         Decorator to require authentication AND a specific permission for routes.
-        
+
         This combines require_auth with permission checking. Use for routes
         that need specific RBAC permissions (e.g., document uploads, config changes).
-        
+
         Args:
             permission: The permission string required (e.g., 'upload:documents')
-            
+
         Returns:
             Decorator function
         """
@@ -3329,7 +3451,7 @@ class FlaskAppWrapper(object):
                         'message': f'Permission denied: requires {permission}',
                         'required_permission': permission
                     }), 403
-                
+
                 return f(*args, **kwargs)
             return decorated_function
         return decorator
@@ -3344,14 +3466,14 @@ class FlaskAppWrapper(object):
                 'logged_in': False,
                 'permissions': get_permission_context()
             })
-        
+
         permissions = get_permission_context()
         return jsonify({
             'logged_in': True,
             'roles': session.get('roles', []),
             'permissions': permissions
         })
-    
+
     def check_permission_endpoint(self):
         """API endpoint to check if user has a specific permission"""
         if not session.get('logged_in'):
@@ -3359,22 +3481,22 @@ class FlaskAppWrapper(object):
                 'error': 'Authentication required',
                 'has_permission': False
             }), 401
-        
+
         data = request.get_json()
         if not data or 'permission' not in data:
             return jsonify({
                 'error': 'Permission name required',
                 'has_permission': False
             }), 400
-        
+
         permission = data['permission']
         roles = session.get('roles', [])
         result = has_permission(permission, roles)
-        
+
         # Get which roles would grant this permission
         registry = get_registry()
         roles_with_permission = registry.get_roles_with_permission(permission)
-        
+
         return jsonify({
             'permission': permission,
             'has_permission': result,
@@ -3448,7 +3570,7 @@ class FlaskAppWrapper(object):
     def get_providers(self):
         """
         Get list of all enabled providers and their available models.
-        
+
         Returns:
             JSON with providers list, each containing:
             - type: Provider type (openai, anthropic, etc.)
@@ -4339,6 +4461,13 @@ class FlaskAppWrapper(object):
         except PlaybookNotFoundError:
             # Deleted between menu load and send: proceed without it (no chip is shown).
             logger.info("Requested playbook '%s' not found; sending the turn without it", playbook_name)
+            # Unified ledger: record the failed /name attempt (no conversation exists
+            # yet, so ids are NULL). Best-effort — never break the turn.
+            try:
+                self._playbook_svc().record_invocation(
+                    None, None, None, playbook_name, source="explicit", status="not_found")
+            except Exception as exc:
+                logger.warning("Could not record not_found playbook invocation: %s", exc)
         except Exception as exc:
             logger.warning("Playbook lookup failed: %s", exc)
 
@@ -4380,24 +4509,24 @@ class FlaskAppWrapper(object):
     def get_provider_models(self):
         """
         Get models for a specific provider.
-        
+
         Query params:
             provider: Provider type (openai, anthropic, gemini, openrouter, local)
-        
+
         Returns:
             JSON with models list
         """
         provider_type = request.args.get('provider')
         if not provider_type:
             return jsonify({'error': 'provider parameter required'}), 400
-        
+
         try:
             from src.archi.providers import get_provider
 
             cfg = _build_provider_config_from_payload(self.config, ProviderType(provider_type))
             provider = get_provider(provider_type, config=cfg) if cfg else get_provider(provider_type)
             models = provider.list_models()
-            
+
             return jsonify({
                 'provider': provider_type,
                 'display_name': provider.display_name,
@@ -4428,25 +4557,25 @@ class FlaskAppWrapper(object):
     def validate_provider(self):
         """
         Validate a provider connection.
-        
+
         Request body:
             provider: Provider type (openai, anthropic, etc.)
-        
+
         Returns:
             JSON with validation result
         """
         payload = request.get_json(silent=True) or {}
         provider_type = payload.get('provider')
-        
+
         if not provider_type:
             return jsonify({'error': 'provider field required'}), 400
-        
+
         try:
             from src.archi.providers import get_provider
-            
+
             provider = get_provider(provider_type)
             is_valid = provider.validate_connection()
-            
+
             return jsonify({
                 'provider': provider_type,
                 'display_name': provider.display_name,
@@ -4464,47 +4593,47 @@ class FlaskAppWrapper(object):
     def set_provider_api_key(self):
         """
         Set an API key for a specific provider.
-        
+
         The API key is stored in the user's session, not in environment variables
         or persistent storage. This provides security (keys are not logged or stored)
         while allowing runtime configuration.
-        
+
         Request body:
             provider: Provider type (openai, anthropic, gemini, openrouter)
             api_key: The API key to set
-        
+
         Returns:
             JSON with success status and provider validation result
         """
         payload = request.get_json(silent=True) or {}
         provider_type = payload.get('provider')
         api_key = payload.get('api_key')
-        
+
         if not provider_type:
             return jsonify({'error': 'provider field required'}), 400
         if not api_key:
             return jsonify({'error': 'api_key field required'}), 400
-        
+
         # Validate the provider type
         try:
             from src.archi.providers import ProviderType
             ptype = ProviderType(provider_type.lower())
         except ValueError:
             return jsonify({'error': f'Unknown provider type: {provider_type}'}), 400
-        
+
         # Store the API key in session
         if 'provider_api_keys' not in session:
             session['provider_api_keys'] = {}
         session['provider_api_keys'][provider_type.lower()] = api_key
         session.modified = True
-        
+
         # Validate the API key by testing the provider
         try:
             from src.archi.providers import get_provider_with_api_key
-            
+
             provider = get_provider_with_api_key(provider_type, api_key)
             is_valid = provider.validate_connection()
-            
+
             return jsonify({
                 'success': True,
                 'provider': provider_type,
@@ -4525,15 +4654,15 @@ class FlaskAppWrapper(object):
     def get_provider_api_keys(self):
         """
         Get a list of which providers have API keys configured.
-        
+
         For security, this does NOT return the actual API keys, only which
         providers have keys set and whether they are valid.
-        
+
         Returns:
             JSON with list of configured providers
         """
         session_keys = session.get('provider_api_keys', {})
-        
+
         try:
             from src.archi.providers import (
                 list_provider_types,
@@ -4541,25 +4670,25 @@ class FlaskAppWrapper(object):
                 get_provider_with_api_key,
                 ProviderType,
             )
-            
+
             providers_status = []
             for provider_type in list_provider_types():
                 # Skip local provider - no API key needed
                 if provider_type == ProviderType.LOCAL:
                     continue
-                    
+
                 ptype_str = provider_type.value
                 has_session_key = ptype_str in session_keys
                 has_env_key = False
                 is_valid = False
                 display_name = ptype_str.title()  # fallback
-                
+
                 try:
                     # Check if there's an env-based key
                     env_provider = get_provider(provider_type)
                     has_env_key = env_provider.is_configured
                     display_name = env_provider.display_name  # use proper display name
-                    
+
                     # If we have a session key, test that one
                     if has_session_key:
                         test_provider = get_provider_with_api_key(
@@ -4571,7 +4700,7 @@ class FlaskAppWrapper(object):
                         is_valid = has_env_key
                 except Exception as e:
                     logger.debug(f"Error checking provider {ptype_str}: {e}")
-                
+
                 providers_status.append({
                     'provider': ptype_str,
                     'display_name': display_name,
@@ -4581,7 +4710,7 @@ class FlaskAppWrapper(object):
                     'valid': is_valid,
                     'masked_key': ('*' * 8 + session_keys[ptype_str][-4:]) if has_session_key else None,
                 })
-            
+
             return jsonify({
                 'providers': providers_status,
             }), 200
@@ -4595,21 +4724,21 @@ class FlaskAppWrapper(object):
     def clear_provider_api_key(self):
         """
         Clear the API key for a specific provider from the session.
-        
+
         Request body:
             provider: Provider type to clear
-        
+
         Returns:
             JSON with success status
         """
         payload = request.get_json(silent=True) or {}
         provider_type = payload.get('provider')
-        
+
         if not provider_type:
             return jsonify({'error': 'provider field required'}), 400
-        
+
         ptype_str = provider_type.lower()
-        
+
         if 'provider_api_keys' in session:
             if ptype_str in session['provider_api_keys']:
                 del session['provider_api_keys'][ptype_str]
@@ -4618,7 +4747,7 @@ class FlaskAppWrapper(object):
                     'success': True,
                     'message': f'API key for {provider_type} cleared from session',
                 }), 200
-        
+
         return jsonify({
             'success': True,
             'message': f'No API key found for {provider_type}',
@@ -4627,38 +4756,38 @@ class FlaskAppWrapper(object):
     def validate_provider_api_key(self):
         """
         Validate an API key for a provider without storing it.
-        
+
         This endpoint allows testing a key before committing to save it.
         The key is NOT stored in the session.
-        
+
         Request body:
             provider: Provider type (openai, anthropic, gemini, openrouter)
             api_key: The API key to validate
-        
+
         Returns:
             JSON with validation result and available models
         """
         payload = request.get_json(silent=True) or {}
         provider_type = payload.get('provider')
         api_key = payload.get('api_key')
-        
+
         if not provider_type:
             return jsonify({'error': 'provider field required'}), 400
         if not api_key:
             return jsonify({'error': 'api_key field required'}), 400
-        
+
         # Validate the provider type
         try:
             from src.archi.providers import ProviderType, get_provider_with_api_key
             ptype = ProviderType(provider_type.lower())
         except ValueError:
             return jsonify({'error': f'Unknown provider type: {provider_type}'}), 400
-        
+
         try:
             # Create provider with the test key (not cached, not stored)
             provider = get_provider_with_api_key(provider_type, api_key)
             is_valid = provider.validate_connection()
-            
+
             # If valid, also get available models
             models = []
             if is_valid:
@@ -4666,7 +4795,7 @@ class FlaskAppWrapper(object):
                     models = [m.to_dict() for m in provider.list_models()]
                 except Exception:
                     pass  # Models list is optional
-            
+
             return jsonify({
                 'valid': is_valid,
                 'provider': provider_type,
@@ -5003,6 +5132,12 @@ class FlaskAppWrapper(object):
         def _event_stream() -> Iterator[str]:
             padding = " " * 2048
             yield json.dumps({"type": "meta", "event": "stream_started", "padding": padding}) + "\n"
+            # A /name-invoked playbook has its body injected server-side (no Playbook tool
+            # call to surface), so emit the applied-playbook activity step up front here.
+            _pending = get_pending_playbook()
+            if _pending and _pending.get("name"):
+                yield json.dumps({"type": "playbook_applied", "name": _pending["name"],
+                                  "body": _pending.get("body", "")}) + "\n"
             for event in self.chat.stream(
                 message,
                 conversation_id,
@@ -5034,7 +5169,7 @@ class FlaskAppWrapper(object):
         # If user is already logged in, redirect to chat
         if session.get('logged_in'):
             return redirect(url_for('index'))
-        
+
         # Render landing page with auth method information
         return render_template('landing.html',
                              sso_enabled=self.sso_enabled,
@@ -5226,7 +5361,7 @@ class FlaskAppWrapper(object):
 
             # Build messages list with trace data for assistant messages
             messages = []
-            
+
             # Batch-fetch trace data for all assistant messages to avoid N+1 queries
             assistant_mids = [row[2] for row in history_rows if row[0] == ARCHI_SENDER and row[2]]
             trace_map = {}
@@ -5242,7 +5377,7 @@ class FlaskAppWrapper(object):
                 """, tuple(assistant_mids))
                 for trace_row in cursor.fetchall():
                     trace_map[trace_row[2]] = trace_row
-            
+
             for row in history_rows:
                 msg = {
                     'sender': row[0],
@@ -5253,7 +5388,7 @@ class FlaskAppWrapper(object):
                     'model_used': row[5] if len(row) > 5 else None,
                     'playbook_name': row[6] if len(row) > 6 else None,
                 }
-                
+
                 # Attach trace data if present
                 if row[0] == ARCHI_SENDER and row[2] and row[2] in trace_map:
                     trace_row = trace_map[row[2]]
@@ -5264,7 +5399,7 @@ class FlaskAppWrapper(object):
                         'total_tool_calls': trace_row[10],
                         'total_duration_ms': trace_row[12],
                     }
-                
+
                 messages.append(msg)
 
             pending_comparisons = [c for c in comparisons if c.preference is None]
@@ -6402,7 +6537,7 @@ class FlaskAppWrapper(object):
         try:
             if request.method == 'DELETE':
                 return self._delete_git_repo()
-            
+
             data = request.json or {}
             repo_url = data.get("repo_url", "").strip()
 
@@ -6495,10 +6630,10 @@ class FlaskAppWrapper(object):
         try:
             data = request.json or {}
             repo_name = data.get("repo_name", "").strip()
-            
+
             if not repo_name:
                 return jsonify({"error": "missing_repo_name"}), 400
-            
+
             return self._delete_source_documents(
                 source_type='git',
                 where_clause='(url LIKE %s OR url LIKE %s)',
@@ -6520,21 +6655,21 @@ class FlaskAppWrapper(object):
                 data = request.json
             except Exception:
                 return jsonify({"error": "invalid_json"}), 400
-            
+
             if data is None:
                 return jsonify({"error": "invalid_json"}), 400
-            
+
             repo_name = data.get("repo_name")
-            
+
             # Type validation: repo_name must be a string
             if repo_name is None or not isinstance(repo_name, str):
                 return jsonify({"error": "invalid_repo_name_type"}), 400
-            
+
             repo_name = repo_name.strip()
 
             if not repo_name:
                 return jsonify({"error": "missing_repo_name"}), 400
-            
+
             # Input validation: reject overly long inputs (max 500 chars for repo names/URLs)
             if len(repo_name) > 500:
                 return jsonify({"error": "repo_name_too_long"}), 400
@@ -6553,16 +6688,16 @@ class FlaskAppWrapper(object):
                 try:
                     with conn.cursor() as cursor:
                         cursor.execute("""
-                            SELECT DISTINCT 
-                                CASE 
+                            SELECT DISTINCT
+                                CASE
                                     WHEN url LIKE 'https://github.com/%' THEN
                                         regexp_replace(url, '^(https://github.com/[^/]+/[^/]+).*', '\\1')
                                     WHEN url LIKE 'https://gitlab.com/%' THEN
                                         regexp_replace(url, '^(https://gitlab.com/[^/]+/[^/]+).*', '\\1')
                                     ELSE url
                                 END as repo_url
-                            FROM documents 
-                            WHERE source_type = 'git' 
+                            FROM documents
+                            WHERE source_type = 'git'
                               AND NOT is_deleted
                               AND url LIKE %s
                             LIMIT 1
@@ -6747,7 +6882,7 @@ class FlaskAppWrapper(object):
             embedded = status_counts.get("embedded", 0)
             failed = status_counts.get("failed", 0)
             total = pending + embedding + embedded + failed
-            
+
             return jsonify({
                 "documents_in_catalog": total,
                 "documents_embedded": embedded,
@@ -6775,18 +6910,18 @@ class FlaskAppWrapper(object):
             search: Search by display name
             limit: Max results (default 50)
             offset: Pagination offset (default 0)
-        
+
         Returns:
             JSON with documents, total, status_counts
         """
         try:
             from src.data_manager.collectors.utils.catalog_postgres import PostgresCatalogService
-            
+
             catalog = PostgresCatalogService(
                 data_path=self.chat.data_path,
                 pg_config=self.chat.pg_config,
             )
-            
+
             result = catalog.list_documents_with_status(
                 status_filter=request.args.get("status"),
                 source_type=request.args.get("source_type"),
@@ -6805,18 +6940,18 @@ class FlaskAppWrapper(object):
 
         Args:
             document_hash: The resource_hash of the document to retry
-        
+
         Returns:
             JSON with success status
         """
         try:
             from src.data_manager.collectors.utils.catalog_postgres import PostgresCatalogService
-            
+
             catalog = PostgresCatalogService(
                 data_path=self.chat.data_path,
                 pg_config=self.chat.pg_config,
             )
-            
+
             reset = catalog.reset_failed_document(document_hash)
             if reset:
                 return jsonify({"success": True, "message": "Document reset to pending"}), 200
@@ -6889,8 +7024,8 @@ class FlaskAppWrapper(object):
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
                     # Get unique git repos by extracting the repo URL from document URLs
                     cursor.execute("""
-                        SELECT DISTINCT 
-                            CASE 
+                        SELECT DISTINCT
+                            CASE
                                 WHEN url LIKE 'https://github.com/%' THEN
                                     regexp_replace(url, '^(https://github.com/[^/]+/[^/]+).*', '\\1')
                                 WHEN url LIKE 'https://gitlab.com/%' THEN
@@ -6899,8 +7034,8 @@ class FlaskAppWrapper(object):
                             END as repo_url,
                             COUNT(*) as file_count,
                             MAX(indexed_at) as last_updated
-                        FROM documents 
-                        WHERE source_type = 'git' 
+                        FROM documents
+                        WHERE source_type = 'git'
                           AND NOT is_deleted
                           AND url IS NOT NULL
                         GROUP BY 1
@@ -6939,7 +7074,7 @@ class FlaskAppWrapper(object):
         try:
             if request.method == 'DELETE':
                 return self._delete_jira_project()
-                
+
             sources = []
             seen_projects = set()
 
@@ -6962,15 +7097,15 @@ class FlaskAppWrapper(object):
 
             for project in sources:
                 project_key = project['key']
-                
+
                 ticket_count = sum(1 for doc in result.get('documents', []) if doc.get('display_name', '').startswith(project_key + '-'))
                 project['ticket_count'] = ticket_count if ticket_count else 0
-                
+
                 last_sync = max((doc.get('ingested_at')
                                 for doc in result.get('documents', [])
                                 if project_key in doc.get('display_name', '') and doc.get('ingested_at') is not None),
                                 default=None)
-                
+
                 project['last_sync'] = last_sync if last_sync else None
 
             return jsonify({"sources": sources}), 200
@@ -6987,10 +7122,10 @@ class FlaskAppWrapper(object):
         try:
             data = request.json or {}
             project_key = data.get("project_key", "").strip()
-            
+
             if not project_key:
                 return jsonify({"error": "missing_project_key"}), 400
-            
+
             return self._delete_source_documents(
                 source_type='jira',
                 where_clause='display_name LIKE %s',
@@ -7035,7 +7170,7 @@ class FlaskAppWrapper(object):
                     }
             except requests.exceptions.RequestException as e:
                 logger.warning(f"Could not fetch scheduler runtime status from data-manager: {e}")
-            
+
             # Convert cron expressions to UI-friendly values
             schedule_display = {}
             cron_to_ui = {
@@ -7044,7 +7179,7 @@ class FlaskAppWrapper(object):
                 '0 */6 * * *': 'every_6h',
                 '0 0 * * *': 'daily',
             }
-            
+
             for source, cron in schedules.items():
                 runtime = jobs_by_source.get(source, {})
                 schedule_display[source] = {
@@ -7053,7 +7188,7 @@ class FlaskAppWrapper(object):
                     'next_run': runtime.get('next_run'),
                     'last_run': runtime.get('last_run'),
                 }
-            
+
             return jsonify({"schedules": schedule_display}), 200
 
         except Exception as e:
@@ -7078,7 +7213,7 @@ class FlaskAppWrapper(object):
 
             if not source:
                 return jsonify({"error": "missing_source"}), 400
-            
+
             valid_sources = ['jira', 'git', 'links', 'local_files', 'redmine', 'sso']
             if source not in valid_sources:
                 return jsonify({"error": f"invalid_source, must be one of {valid_sources}"}), 400
@@ -7088,9 +7223,9 @@ class FlaskAppWrapper(object):
             if session.get('logged_in'):
                 user = session.get('user', {})
                 user_id = user.get('username') or user.get('email') or 'anonymous'
-            
+
             schedules = self.config_service.update_source_schedule(
-                source, 
+                source,
                 schedule,
                 updated_by=user_id
             )
@@ -7154,7 +7289,7 @@ class FlaskAppWrapper(object):
             # Get list of tables with row counts
             # Note: pg_stat_user_tables uses 'relname' not 'tablename' in some PostgreSQL versions
             cursor.execute("""
-                SELECT 
+                SELECT
                     schemaname,
                     relname as tablename,
                     n_live_tup as row_count

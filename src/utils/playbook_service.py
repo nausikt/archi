@@ -10,7 +10,11 @@ import yaml
 from psycopg2 import errors as pg_errors
 
 from src.utils.logging import get_logger
-from src.utils.sql import SQL_INSERT_PLAYBOOK_TURN, SQL_LAST_PLAYBOOK_NAME_FOR_SENDER
+from src.utils.sql import (
+    SQL_INSERT_PLAYBOOK_INVOCATION,
+    SQL_INSERT_PLAYBOOK_TURN,
+    SQL_LAST_PLAYBOOK_NAME_FOR_SENDER,
+)
 
 logger = get_logger(__name__)
 
@@ -527,6 +531,31 @@ class PlaybookService:
                     "CREATE INDEX IF NOT EXISTS idx_user_enabled_playbooks_user "
                     "ON user_enabled_playbooks(user_id)"
                 )
+                # Unified invocation ledger: one honest row per playbook use across
+                # BOTH sources (explicit /name and model-invoked auto), with a status.
+                # NO owner_id (owner ids double as access credentials); NO FK on
+                # playbook_id (a row must survive the playbook's deletion). Keep this
+                # DDL textually identical to src/cli/templates/init.sql.
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS playbook_invocations (
+                        id              SERIAL PRIMARY KEY,
+                        conversation_id INTEGER,
+                        message_id      INTEGER,
+                        playbook_id     INTEGER,
+                        playbook_name   VARCHAR(100) NOT NULL,
+                        source          TEXT NOT NULL CHECK (source IN ('explicit', 'auto')),
+                        status          TEXT NOT NULL DEFAULT 'ok'
+                                        CHECK (status IN ('ok', 'not_found', 'unavailable', 'error')),
+                        arm             TEXT,
+                        ts              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_playbook_invocations_name_ts "
+                    "ON playbook_invocations(playbook_name, ts)"
+                )
             conn.commit()
         finally:
             self._release_connection(conn)
@@ -548,6 +577,33 @@ class PlaybookService:
         try:
             with conn.cursor() as cursor:
                 cursor.execute(SQL_INSERT_PLAYBOOK_TURN, (message_id, playbook_name, playbook_id))
+            conn.commit()
+        finally:
+            self._release_connection(conn)
+
+    def record_invocation(
+        self, conversation_id, message_id, playbook_id, playbook_name,
+        source, status="ok", arm=None,
+    ) -> None:
+        """Append one row to the unified invocation ledger (playbook_invocations).
+
+        Covers BOTH the explicit /name path and the model-invoked (auto) Playbook
+        tool, with a `status` (ok/not_found/unavailable/error) and an optional A/B
+        `arm`. conversation_id/message_id/playbook_id may be NULL (e.g. a failed
+        /name before any conversation exists). No-op for a falsy playbook_name (the
+        column is NOT NULL). Raises on DB errors — callers wrap it best-effort so a
+        missing ledger table never breaks a turn (mirrors record_playbook_turn).
+        """
+        if not playbook_name:
+            return
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    SQL_INSERT_PLAYBOOK_INVOCATION,
+                    (conversation_id, message_id, playbook_id, playbook_name,
+                     source, status, arm),
+                )
             conn.commit()
         finally:
             self._release_connection(conn)
@@ -733,5 +789,3 @@ def parse_playbook_md(text: str, fallback_name: str = "") -> Dict[str, str]:
         "body": "\n".join(lines[idx:]).strip(),
         "visibility": "public" if visibility == "public" else "private",
     }
-
-

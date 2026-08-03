@@ -1,7 +1,7 @@
 # Base Python dependencies shared by all service images.
 # Changes here trigger a base-image rebuild in CI.
 backoff==2.2.1
-beautifulsoup4==4.12.3 
+beautifulsoup4==4.12.3
 clickhouse-connect==0.6.6
 coloredlogs==15.0.1
 duckdb==0.8.1
@@ -22,6 +22,7 @@ langgraph==1.0.2
 # 0.2.x provides langchain_mcp_adapters.interceptors (per-call MCP headers); 0.1.x does not.
 langchain-mcp-adapters==0.2.2
 mcp>=1.9.2,<2
+langgraph-prebuilt==1.0.8
 langchain==1.0.3
 langchain_ollama==1.0.0
 loguru==0.7.2

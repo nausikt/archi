@@ -26,22 +26,22 @@ END $$;
 
 CREATE TABLE IF NOT EXISTS users (
     id VARCHAR(200) PRIMARY KEY,  -- From auth provider or generated client_id
-    
+
     -- Identity
     display_name TEXT,
     email TEXT,
     auth_provider VARCHAR(50) NOT NULL DEFAULT 'anonymous',  -- 'anonymous', 'local', 'github'
-    
+
     -- Local auth
     password_hash VARCHAR(256),           -- For local accounts (Werkzeug pbkdf2)
-    
+
     -- GitHub OAuth
     github_id VARCHAR(100),               -- GitHub user ID
     github_username VARCHAR(100),         -- GitHub username
-    
+
     -- Role
     is_admin BOOLEAN NOT NULL DEFAULT FALSE,
-    
+
     -- Preferences (explicit columns for known fields)
     theme VARCHAR(20) NOT NULL DEFAULT 'system',
     preferred_model VARCHAR(200),          -- Override global default
@@ -54,18 +54,18 @@ CREATE TABLE IF NOT EXISTS users (
     preferred_system_prompt VARCHAR(100),
     preferred_top_p NUMERIC(3,2),
     preferred_top_k INTEGER,
-    
+
     -- BYOK API keys (encrypted with pgcrypto)
     -- Keys stored as: pgp_sym_encrypt(key, encryption_key)
     -- Encryption key comes from BYOK_ENCRYPTION_KEY env var
     api_key_openrouter BYTEA,      -- Encrypted
-    api_key_openai BYTEA,          -- Encrypted  
+    api_key_openai BYTEA,          -- Encrypted
     api_key_anthropic BYTEA,       -- Encrypted
-    
+
     -- Session tracking
     last_login_at TIMESTAMPTZ,
     login_count INTEGER NOT NULL DEFAULT 0,
-    
+
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -95,27 +95,27 @@ CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 
 CREATE TABLE IF NOT EXISTS static_config (
     id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),  -- Enforce single row
-    
+
     -- Deployment identity
     deployment_name VARCHAR(100) NOT NULL,
     config_version VARCHAR(20) NOT NULL DEFAULT '2.0.0',
-    
+
     -- Paths
     data_path TEXT NOT NULL DEFAULT '/root/data/',
     prompts_path TEXT NOT NULL DEFAULT '/root/archi/data/prompts/',
-    
+
     -- Embedding configuration (affects vector dimensions - can't change at runtime)
     embedding_model VARCHAR(200) NOT NULL,
     embedding_dimensions INTEGER NOT NULL,
     chunk_size INTEGER NOT NULL DEFAULT 1000,
     chunk_overlap INTEGER NOT NULL DEFAULT 150,
     distance_metric VARCHAR(20) NOT NULL DEFAULT 'cosine',
-    
+
     -- Available options (what's installed/configured)
     available_pipelines TEXT[] NOT NULL DEFAULT '{}',
     available_models TEXT[] NOT NULL DEFAULT '{}',
     available_providers TEXT[] NOT NULL DEFAULT '{}',
-    
+
     -- Auth configuration
     auth_enabled BOOLEAN NOT NULL DEFAULT TRUE,
     session_lifetime_days INTEGER NOT NULL DEFAULT 30,
@@ -127,7 +127,7 @@ CREATE TABLE IF NOT EXISTS static_config (
     archi_config JSONB NOT NULL DEFAULT '{}'::jsonb,
     global_config JSONB NOT NULL DEFAULT '{}'::jsonb,
     mcp_servers_config JSONB NOT NULL DEFAULT '{}'::jsonb,
-    
+
     -- Timestamps
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -138,37 +138,37 @@ CREATE TABLE IF NOT EXISTS static_config (
 
 CREATE TABLE IF NOT EXISTS dynamic_config (
     id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),  -- Enforce single row
-    
+
     -- Model settings
     active_pipeline VARCHAR(100) NOT NULL DEFAULT 'QAPipeline',
     active_model VARCHAR(200) NOT NULL DEFAULT 'openai/gpt-4o',
     temperature NUMERIC(3,2) NOT NULL DEFAULT 0.7,
     max_tokens INTEGER NOT NULL DEFAULT 4096,
     system_prompt TEXT,  -- NULL = use pipeline default
-    
+
     -- Additional generation params
     top_p NUMERIC(3,2) NOT NULL DEFAULT 0.9,
     top_k INTEGER NOT NULL DEFAULT 50,
     repetition_penalty NUMERIC(4,2) NOT NULL DEFAULT 1.0,
-    
+
     -- Prompt selection (file names without extension)
     active_condense_prompt VARCHAR(100) NOT NULL DEFAULT 'default',
     active_chat_prompt VARCHAR(100) NOT NULL DEFAULT 'default',
     active_system_prompt VARCHAR(100) NOT NULL DEFAULT 'default',
-    
+
     -- Retrieval settings
     num_documents_to_retrieve INTEGER NOT NULL DEFAULT 10,
     use_hybrid_search BOOLEAN NOT NULL DEFAULT TRUE,
     bm25_weight NUMERIC(3,2) NOT NULL DEFAULT 0.3,
     semantic_weight NUMERIC(3,2) NOT NULL DEFAULT 0.7,
-    
+
     -- Schedules
     ingestion_schedule VARCHAR(100) NOT NULL DEFAULT '',  -- Cron expression
     source_schedules JSONB NOT NULL DEFAULT '{}'::jsonb,  -- Per-source schedules
-    
+
     -- Logging
     verbosity INTEGER NOT NULL DEFAULT 3,
-    
+
     -- Metadata
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_by VARCHAR(200)  -- user_id who made the change
@@ -201,48 +201,48 @@ CREATE INDEX IF NOT EXISTS idx_config_audit_time ON config_audit(changed_at DESC
 CREATE TABLE IF NOT EXISTS documents (
     id SERIAL PRIMARY KEY,
     resource_hash VARCHAR(64) UNIQUE NOT NULL,
-    
+
     -- File location (relative to data_path)
     file_path TEXT NOT NULL,
-    
+
     -- Display info
     display_name TEXT NOT NULL,
     source_type VARCHAR(50) NOT NULL,  -- 'local_files', 'web', 'ticket', 'git'
-    
+
     -- Source-specific fields
     url TEXT,                    -- For web sources
     ticket_id VARCHAR(100),      -- For ticket sources
     git_repo VARCHAR(200),       -- For git sources
     git_commit VARCHAR(64),      -- For git sources
-    
+
     -- File metadata
     suffix VARCHAR(20),
     size_bytes BIGINT,
     mime_type VARCHAR(100),
-    
+
     -- Provenance
     original_path TEXT,
     base_path TEXT,              -- For relative path reconstruction
     relative_path TEXT,          -- Path relative to base_path
-    
+
     -- Extensible metadata (for source-specific fields not in columns)
     extra_json JSONB,            -- Structured extra metadata
     extra_text TEXT,             -- Searchable text representation
-    
+
     -- Timestamps
     file_modified_at TIMESTAMPTZ,
     ingested_at TIMESTAMPTZ,
     indexed_at TIMESTAMPTZ,        -- When embeddings were created
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    
+
     -- Ingestion tracking
     ingestion_status VARCHAR(20) NOT NULL DEFAULT 'pending',
     ingestion_error TEXT,
-    
+
     -- Soft delete
     is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     deleted_at TIMESTAMPTZ,
-    
+
     CONSTRAINT valid_source CHECK (source_type IN ('local_files', 'web', 'ticket', 'git', 'sso', 'unknown')),
     CONSTRAINT valid_ingestion_status CHECK (ingestion_status IN ('pending', 'embedding', 'embedded', 'failed'))
 );
@@ -259,21 +259,21 @@ CREATE TABLE IF NOT EXISTS document_chunks (
     id SERIAL PRIMARY KEY,
     document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
     chunk_index INTEGER NOT NULL,
-    
+
     -- Chunk content
     chunk_text TEXT NOT NULL,
-    
+
     -- Vector embedding (dimension set at deploy time)
     -- Common dimensions: 384 (all-MiniLM-L6-v2), 1536 (text-embedding-ada-002)
     embedding vector({{ embedding_dimensions | default(384) }}),
-    
+
     -- Chunk metadata
     start_char INTEGER,
     end_char INTEGER,
     metadata JSONB,              -- Original document metadata propagated to chunk
-    
+
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    
+
     UNIQUE(document_id, chunk_index)
 );
 
@@ -281,13 +281,13 @@ CREATE INDEX IF NOT EXISTS idx_chunks_document ON document_chunks(document_id);
 
 -- Vector index (HNSW - default, good balance of speed/accuracy)
 {% if vector_index_type | default('hnsw') == 'hnsw' -%}
-CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON document_chunks 
-    USING hnsw (embedding vector_cosine_ops) 
+CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON document_chunks
+    USING hnsw (embedding vector_cosine_ops)
     WITH (m = {{ vector_index_hnsw_m | default(16) }}, ef_construction = {{ vector_index_hnsw_ef | default(64) }});
 {% elif vector_index_type == 'ivfflat' -%}
 -- IVFFlat index (create AFTER data is loaded for best results)
-CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON document_chunks 
-    USING ivfflat (embedding vector_cosine_ops) 
+CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON document_chunks
+    USING ivfflat (embedding vector_cosine_ops)
     WITH (lists = {{ vector_index_ivfflat_lists | default(100) }});
 {% else -%}
 -- No vector index (exact search - for small datasets or testing)
@@ -297,12 +297,12 @@ CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON document_chunks
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_textsearch') THEN
-        EXECUTE 'CREATE INDEX IF NOT EXISTS idx_chunks_bm25 ON document_chunks 
+        EXECUTE 'CREATE INDEX IF NOT EXISTS idx_chunks_bm25 ON document_chunks
             USING bm25(chunk_text) WITH (text_config=''english'')';
         RAISE NOTICE 'BM25 index created on document_chunks';
     ELSE
         -- Fallback: create GIN index on tsvector for basic full-text search
-        EXECUTE 'ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS chunk_tsv tsvector 
+        EXECUTE 'ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS chunk_tsv tsvector
             GENERATED ALWAYS AS (to_tsvector(''english'', chunk_text)) STORED';
         EXECUTE 'CREATE INDEX IF NOT EXISTS idx_chunks_fts ON document_chunks USING gin(chunk_tsv)';
         RAISE NOTICE 'Fallback GIN tsvector index created (pg_textsearch not available)';
@@ -319,7 +319,7 @@ CREATE TABLE IF NOT EXISTS user_document_defaults (
     document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     enabled BOOLEAN NOT NULL DEFAULT FALSE,  -- FALSE = opted out
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    
+
     PRIMARY KEY (user_id, document_id)
 );
 
@@ -331,7 +331,7 @@ CREATE TABLE IF NOT EXISTS conversation_doc_overrides (
     document_hash VARCHAR NOT NULL,  -- Hash reference to document (denormalized for simplicity)
     enabled BOOLEAN NOT NULL,  -- Explicit override value
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    
+
     PRIMARY KEY (conversation_id, document_hash)
 );
 
@@ -375,26 +375,26 @@ BEGIN
             DROP CONSTRAINT conversation_doc_overrides_conversation_id_fkey;
     END IF;
 END $$;
-ALTER TABLE conversation_doc_overrides 
-    ADD CONSTRAINT conversation_doc_overrides_conversation_id_fkey 
+ALTER TABLE conversation_doc_overrides
+    ADD CONSTRAINT conversation_doc_overrides_conversation_id_fkey
     FOREIGN KEY (conversation_id) REFERENCES conversation_metadata(conversation_id) ON DELETE CASCADE;
 
 CREATE TABLE IF NOT EXISTS conversations (
     message_id SERIAL PRIMARY KEY,
     conversation_id INTEGER NOT NULL REFERENCES conversation_metadata(conversation_id) ON DELETE CASCADE,
-    
+
     archi_service TEXT NOT NULL,
     sender TEXT NOT NULL,
     content TEXT NOT NULL,
-    
+
     -- NEW: Capture what was actually used (replaces conf_id join)
     model_used VARCHAR(200),
     pipeline_used VARCHAR(100),
-    
+
     -- RAG context
     link TEXT NOT NULL DEFAULT '',
     context TEXT NOT NULL DEFAULT '',
-    
+
     ts TIMESTAMPTZ NOT NULL,
 
     conf_id INTEGER REFERENCES configs(config_id)
@@ -413,7 +413,7 @@ CREATE TABLE IF NOT EXISTS feedback (
     incorrect BOOLEAN,                -- Flag: response was factually incorrect
     unhelpful BOOLEAN,                -- Flag: response didn't help
     inappropriate BOOLEAN,            -- Flag: response was inappropriate
-    
+
     PRIMARY KEY (mid, feedback_ts)
 );
 
@@ -444,22 +444,22 @@ CREATE TABLE IF NOT EXISTS agent_traces (
     conversation_id INTEGER NOT NULL REFERENCES conversation_metadata(conversation_id) ON DELETE CASCADE,
     message_id INTEGER REFERENCES conversations(message_id) ON DELETE SET NULL,
     user_message_id INTEGER REFERENCES conversations(message_id) ON DELETE SET NULL,
-    
+
     config_id VARCHAR(100),
     pipeline_name VARCHAR(100) NOT NULL,
     events JSONB NOT NULL DEFAULT '[]',
-    
+
     started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at TIMESTAMPTZ,
     status VARCHAR(20) NOT NULL DEFAULT 'running',  -- running, completed, cancelled, failed
-    
+
     total_tool_calls INTEGER DEFAULT 0,
     total_tokens_used INTEGER DEFAULT 0,
     total_duration_ms INTEGER,
-    
+
     cancelled_by VARCHAR(100),
     cancellation_reason TEXT,
-    
+
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -471,12 +471,12 @@ CREATE TABLE IF NOT EXISTS agent_tool_calls (
     id SERIAL PRIMARY KEY,
     conversation_id INTEGER NOT NULL REFERENCES conversation_metadata(conversation_id) ON DELETE CASCADE,
     message_id INTEGER NOT NULL REFERENCES conversations(message_id) ON DELETE CASCADE,
-    
+
     step_number INTEGER NOT NULL,
     tool_name VARCHAR(100) NOT NULL,
     tool_args JSONB,
     tool_result TEXT,
-    
+
     ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -494,22 +494,22 @@ CREATE TABLE IF NOT EXISTS ab_comparisons (
     user_prompt_mid INTEGER NOT NULL REFERENCES conversations(message_id) ON DELETE CASCADE,
     response_a_mid INTEGER NOT NULL REFERENCES conversations(message_id) ON DELETE CASCADE,
     response_b_mid INTEGER NOT NULL REFERENCES conversations(message_id) ON DELETE CASCADE,
-    
+
     -- Model/pipeline info (optional - can be derived from config_*_id if not set)
     model_a VARCHAR(200),
     model_b VARCHAR(200),
     pipeline_a VARCHAR(100),
     pipeline_b VARCHAR(100),
-    
+
     config_a_id INTEGER REFERENCES configs(config_id),
     config_b_id INTEGER REFERENCES configs(config_id),
-    
+
     -- Pool-based variant info (populated when ab_testing pool is active)
     variant_a_name VARCHAR(200),
     variant_b_name VARCHAR(200),
     variant_a_meta JSONB,
     variant_b_meta JSONB,
-    
+
     is_config_a_first BOOLEAN NOT NULL,
     preference VARCHAR(10),
     preference_ts TIMESTAMPTZ,
@@ -610,7 +610,7 @@ BEGIN
 END $$;
 
 GRANT USAGE ON SCHEMA public TO grafana;
-GRANT SELECT ON 
+GRANT SELECT ON
     users,
     static_config,
     dynamic_config,
@@ -672,8 +672,37 @@ CREATE TABLE IF NOT EXISTS user_enabled_playbooks (
 CREATE INDEX IF NOT EXISTS idx_user_enabled_playbooks_user ON user_enabled_playbooks(user_id);
 
 -- ============================================================================
+-- 14. PLAYBOOK INVOCATIONS (unified usage ledger — both sources, with status)
+-- ============================================================================
+-- One honest row per playbook use, for BOTH the explicit /name path and the
+-- model-invoked (auto) Playbook tool. Distinct from conversation_playbook_turns
+-- (which serves only the chip/regenerate for explicit /name turns). Keep this DDL
+-- textually identical to PlaybookService.ensure_schema. NO owner_id (owner ids
+-- double as access credentials); NO FK on playbook_id (a row must survive the
+-- playbook's deletion).
+CREATE TABLE IF NOT EXISTS playbook_invocations (
+    id              SERIAL PRIMARY KEY,
+    conversation_id INTEGER,
+    message_id      INTEGER,
+    playbook_id     INTEGER,
+    playbook_name   VARCHAR(100) NOT NULL,
+    source          TEXT NOT NULL CHECK (source IN ('explicit', 'auto')),
+    status          TEXT NOT NULL DEFAULT 'ok'
+                    CHECK (status IN ('ok', 'not_found', 'unavailable', 'error')),
+    arm             TEXT,
+    ts              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_playbook_invocations_name_ts ON playbook_invocations(playbook_name, ts);
+
+-- Grafana reads the usage ledger for dashboards. A dedicated grant (not the
+-- section-11 bulk list) because that block runs before this table exists.
+{% if use_grafana %}
+GRANT SELECT ON playbook_invocations TO grafana;
+{% endif %}
+
+-- ============================================================================
 -- NOTES
 -- ============================================================================
--- 
+--
 -- Grafana queries use model_used and pipeline_used columns directly:
 -- SELECT c.*, c.model_used, c.pipeline_used FROM conversations c

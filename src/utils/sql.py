@@ -428,6 +428,16 @@ VALUES (%s, %s, %s)
 ON CONFLICT (message_id) DO NOTHING;
 """
 
+# Unified invocation ledger: one honest row per playbook use, for BOTH the
+# explicit /name path and the model-invoked (auto) Playbook tool, with a status.
+# Distinct from the side table above (which serves only the chip/regenerate for
+# explicit /name turns). No owner_id — owner ids double as access credentials.
+SQL_INSERT_PLAYBOOK_INVOCATION = """
+INSERT INTO playbook_invocations
+    (conversation_id, message_id, playbook_id, playbook_name, source, status, arm)
+VALUES (%s, %s, %s, %s, %s, %s, %s);
+"""
+
 # Refresh/regenerate re-applies the playbook of the conversation's NEWEST sender
 # turn. The LEFT JOIN is load-bearing: it returns that turn's playbook_name, or
 # NULL when the newest turn had none. An INNER JOIN would instead skip past a

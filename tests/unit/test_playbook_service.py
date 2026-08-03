@@ -221,6 +221,75 @@ def test_record_playbook_turn_raises_on_db_error(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Unified invocation ledger (playbook_invocations)
+# ---------------------------------------------------------------------------
+
+def test_record_invocation_executes_insert(monkeypatch):
+    """An explicit /name use lands one row: params carry conversation_id,
+    message_id, playbook_id, name, source and status in column order; arm NULL."""
+    svc = PlaybookService(pg_config={"dummy": True})
+    cursor = _RecordingCursor()
+    conn = _RecordingConn(cursor)
+    monkeypatch.setattr(svc, "_get_connection", lambda: conn)
+    monkeypatch.setattr(svc, "_release_connection", lambda c: None)
+    svc.record_invocation(5, 11, 3, "rucio-triage", "explicit", "ok")
+    statement, params = cursor.executed[0]
+    assert statement == sql.SQL_INSERT_PLAYBOOK_INVOCATION
+    assert params == (5, 11, 3, "rucio-triage", "explicit", "ok", None)
+    assert conn.committed
+
+
+def test_record_invocation_defaults_status_and_carries_arm(monkeypatch):
+    """status defaults to 'ok'; an A/B-arm auto row carries its arm label."""
+    svc = PlaybookService(pg_config={"dummy": True})
+    cursor = _RecordingCursor()
+    conn = _RecordingConn(cursor)
+    monkeypatch.setattr(svc, "_get_connection", lambda: conn)
+    monkeypatch.setattr(svc, "_release_connection", lambda c: None)
+    svc.record_invocation(9, 21, None, "auto-pb", "auto", arm="b")
+    _, params = cursor.executed[0]
+    assert params == (9, 21, None, "auto-pb", "auto", "ok", "b")
+
+
+def test_record_invocation_failed_explicit_writes_null_ids(monkeypatch):
+    """A failed /name (playbook not found) has no conversation yet — the row
+    carries NULL conversation_id/message_id/playbook_id but the attempted name."""
+    svc = PlaybookService(pg_config={"dummy": True})
+    cursor = _RecordingCursor()
+    conn = _RecordingConn(cursor)
+    monkeypatch.setattr(svc, "_get_connection", lambda: conn)
+    monkeypatch.setattr(svc, "_release_connection", lambda c: None)
+    svc.record_invocation(None, None, None, "ghost-pb", "explicit", "not_found")
+    _, params = cursor.executed[0]
+    assert params == (None, None, None, "ghost-pb", "explicit", "not_found", None)
+
+
+def test_record_invocation_skips_without_name(monkeypatch):
+    """A falsy playbook_name is a no-op (the column is NOT NULL) — never connects."""
+    svc = PlaybookService(pg_config={"dummy": True})
+
+    def no_connect():
+        raise AssertionError("record_invocation must not connect for a no-op")
+
+    monkeypatch.setattr(svc, "_get_connection", no_connect)
+    svc.record_invocation(1, 2, 3, "", "auto")
+    svc.record_invocation(1, 2, 3, None, "explicit")
+
+
+def test_record_invocation_raises_on_db_error(monkeypatch):
+    """The service reports DB errors; callers wrap it best-effort so a missing
+    ledger table never breaks a turn (mirrors record_playbook_turn)."""
+    svc = PlaybookService(pg_config={"dummy": True})
+
+    def boom():
+        raise RuntimeError("ledger missing")
+
+    monkeypatch.setattr(svc, "_get_connection", boom)
+    with pytest.raises(RuntimeError, match="ledger missing"):
+        svc.record_invocation(1, 2, 3, "rucio-triage", "explicit")
+
+
+# ---------------------------------------------------------------------------
 # ensure_schema (moved here from the chat-app wrapper's _ensure_playbook_schema)
 # ---------------------------------------------------------------------------
 
@@ -248,6 +317,18 @@ def test_ensure_schema_creates_playbook_schema_idempotently(monkeypatch):
         if statement.strip().upper().startswith(("CREATE TABLE", "CREATE INDEX", "CREATE UNIQUE INDEX")):
             assert "IF NOT EXISTS" in statement, f"non-idempotent DDL: {statement[:60]}"
     assert conn.committed
+
+
+def test_ensure_schema_creates_playbook_invocations_table(monkeypatch):
+    """The unified ledger table + its (playbook_name, ts) index are created, and
+    the ledger never carries an owner_id column (owner ids double as credentials)."""
+    cursor, _ = _run_ensure_schema(monkeypatch, fetchone_values=[None])
+    blob = "\n".join(statement for statement, _ in cursor.executed)
+    assert "CREATE TABLE IF NOT EXISTS playbook_invocations" in blob
+    assert "idx_playbook_invocations" in blob
+    inv_ddl = [s for s, _ in cursor.executed if "playbook_invocations" in s]
+    assert inv_ddl, "no playbook_invocations DDL was issued"
+    assert all("owner_id" not in s for s in inv_ddl), "ledger must have no owner_id column"
 
 
 def test_ensure_schema_skips_legacy_copy_without_column(monkeypatch):

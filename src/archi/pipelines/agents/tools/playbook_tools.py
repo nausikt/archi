@@ -240,13 +240,18 @@ def create_playbook_tool(
 ) -> Callable:
     """Build the `Playbook` tool: load a playbook's full instructions into context (Level 2)."""
 
-    @tool("Playbook", description=PLAYBOOK_TOOL_DESCRIPTION, args_schema=_PlaybookToolInput)
-    def _playbook(playbook: str, args: str = "") -> str:
+    # response_format="content_and_artifact": the tool returns (content, artifact).
+    # The model only ever sees `content` (the body); the artifact rides on the
+    # ToolMessage so the UI can show WHICH playbook auto-loaded — without leaking the
+    # name into the model's context. Every return path must therefore be a 2-tuple.
+    @tool("Playbook", description=PLAYBOOK_TOOL_DESCRIPTION, args_schema=_PlaybookToolInput,
+          response_format="content_and_artifact")
+    def _playbook(playbook: str, args: str = ""):
         owner = get_owner()
         # service is None when playbooks are disabled; owner is None before a request sets
         # it — both degrade gracefully here rather than erroring.
         if service is None or not owner:
-            return "Playbooks are unavailable in this session."
+            return "Playbooks are unavailable in this session.", None
         try:
             playbook = service.resolve_invokable_playbook(owner, playbook)
         except PlaybookNotFoundError:
@@ -254,10 +259,10 @@ def create_playbook_tool(
                 f"No playbook named '{playbook}' is in your list. If it is a public playbook, "
                 f"ask the user to add it from the playbooks panel (or by selecting it in the /menu) "
                 f"first. Available now:\n{_safe_catalog(service, owner)}"
-            )
+            ), None
         except Exception as e:  # pragma: no cover - defensive
             logger.error("Playbook tool failed: %s", e)
-            return f"Could not load playbook '{playbook}': {e}"
+            return f"Could not load playbook '{playbook}': {e}", None
         body = playbook.body
         # Claude Code's argument rule: substitute $ARGUMENTS when present, otherwise
         # append the arguments so the playbook still sees them.
@@ -267,9 +272,30 @@ def create_playbook_tool(
             body = f"{body}\n\nARGUMENTS: {args}"
         if playbook.owner_id != owner:
             body = FOREIGN_PLAYBOOK_FENCE + body
-        return body
+        # playbook_id rides on the artifact (server-side only; the model never sees
+        # artifacts) so the auto-load ledger and the UI step can carry the real id.
+        return body, {"kind": "playbook", "playbook_name": playbook.name, "playbook_id": playbook.id}
 
     return _playbook
+
+
+def classify_playbook_tool_result(result) -> str:
+    """Map a Playbook tool's result string to an invocation-ledger status.
+
+    An auto (model-invoked) load returns the loaded body on success (any other
+    text) or one of three known error strings. This is the artifact-less fallback:
+    a successful load's resolved name/id ride on the ToolMessage artifact (the
+    reliable signal), so this classifier only needs to recognise the error paths.
+    Keep these prefixes in sync with the return strings in create_playbook_tool.
+    """
+    text = result or ""
+    if text.startswith("No playbook named"):
+        return "not_found"
+    if text.startswith("Playbooks are unavailable"):
+        return "unavailable"
+    if text.startswith("Could not load playbook"):
+        return "error"
+    return "ok"
 
 
 def create_save_playbook_tool(

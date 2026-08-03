@@ -1374,6 +1374,42 @@ def test_init_sql_conversations_has_no_playbook_name():
         assert "playbook_name" not in text[start:end], rel
 
 
+def test_init_sql_creates_playbook_invocations_and_grants_grafana():
+    """The unified ledger table exists in init.sql (fresh installs), is granted to
+    the Grafana read-only role, and never declares an owner_id column."""
+    import re
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    text = (root / "src/cli/templates/init.sql").read_text()
+    start = text.index("CREATE TABLE IF NOT EXISTS playbook_invocations")
+    end = text.index(");", start)
+    ddl = text[start:end]
+    assert "owner_id" not in ddl, "ledger must have no owner_id column"
+    assert "source" in ddl and "status" in ddl and "arm" in ddl
+    # Granted SELECT to grafana. A dedicated grant (co-located after the CREATE) is
+    # required here: the section-11 bulk grant runs before the playbook tables exist.
+    assert re.search(
+        r"GRANT SELECT ON[^;]*\bplaybook_invocations\b[^;]*TO grafana;", text, re.S
+    ), "playbook_invocations must be granted SELECT to grafana"
+    # index on (playbook_name, ts)
+    assert "idx_playbook_invocations" in text
+
+
+def test_init_sql_and_ensure_schema_ledger_columns_match():
+    """The init.sql table and PlaybookService.ensure_schema declare the same
+    ledger columns (they must not drift — DB source of truth vs Helm boot path)."""
+    from pathlib import Path
+    import inspect
+    from src.utils.playbook_service import PlaybookService
+    root = Path(__file__).resolve().parents[2]
+    init_sql = (root / "src/cli/templates/init.sql").read_text()
+    ensure_src = inspect.getsource(PlaybookService.ensure_schema)
+    for token in ("playbook_invocations", "conversation_id", "message_id",
+                  "playbook_id", "playbook_name", "source", "status", "arm"):
+        assert token in init_sql, f"init.sql missing {token}"
+        assert token in ensure_src, f"ensure_schema missing {token}"
+
+
 # =============================================================================
 # New gap-filling tests (Categories 1-6)
 # =============================================================================

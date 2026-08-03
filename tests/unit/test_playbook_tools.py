@@ -11,6 +11,7 @@ from src.archi.pipelines.agents.tools.playbook_tools import (
     create_save_playbook_tool, create_update_playbook_tool, create_delete_playbook_tool,
     set_playbook_owner, get_playbook_owner,
     set_pending_playbook, get_pending_playbook, clear_pending_playbook,
+    classify_playbook_tool_result,
     PLAYBOOK_LISTING_PREAMBLE,
 )
 
@@ -28,6 +29,20 @@ def test_playbook_tool_returns_body():
     tool = create_playbook_tool(svc, _owner)
     assert tool.name == "Playbook"
     assert tool.invoke({"playbook": "rucio-triage"}) == "THE BODY"
+
+
+def test_playbook_tool_artifact_carries_resolved_id_and_name():
+    """A successful tool-call load rides the resolved (id, name) on the ToolMessage
+    artifact — server-side only — so the auto-load ledger can store the real id."""
+    from langchain_core.messages import ToolMessage
+    svc = MagicMock()
+    svc.resolve_invokable_playbook.return_value = Playbook(
+        id=17, name="rucio-triage", description="d", body="THE BODY", owner_id="c1")
+    tool = create_playbook_tool(svc, _owner)
+    tm = tool.invoke({"type": "tool_call", "name": "Playbook",
+                      "args": {"playbook": "rucio-triage"}, "id": "call_pb"})
+    assert isinstance(tm, ToolMessage)
+    assert tm.artifact == {"kind": "playbook", "playbook_name": "rucio-triage", "playbook_id": 17}
 
 
 def test_playbook_tool_not_found_lists_available():
@@ -1188,3 +1203,28 @@ def test_playbook_tool_refuses_unenabled_public(make_fake_service):
     out = tool.invoke({"playbook": "deploy", "args": ""})
     assert "deploy" in out and ("add" in out.lower() or "list" in out.lower())
     assert "BODY" not in out   # body never returned for an unenabled public
+
+
+# ── classify_playbook_tool_result: map a Playbook tool result string to a status ──────
+
+def test_classify_playbook_result_not_found():
+    msg = ("No playbook named 'ghost' is in your list. If it is a public playbook, "
+           "ask the user to add it first. Available now:\n- a: da")
+    assert classify_playbook_tool_result(msg) == "not_found"
+
+
+def test_classify_playbook_result_unavailable():
+    assert classify_playbook_tool_result(
+        "Playbooks are unavailable in this session.") == "unavailable"
+
+
+def test_classify_playbook_result_error():
+    assert classify_playbook_tool_result(
+        "Could not load playbook 'x': connection reset") == "error"
+
+
+def test_classify_playbook_result_ok_for_a_loaded_body():
+    # Anything that is not a known error prefix is a successfully loaded body.
+    assert classify_playbook_tool_result("STEP 1\nSTEP 2\nSource: live") == "ok"
+    assert classify_playbook_tool_result("") == "ok"
+    assert classify_playbook_tool_result(None) == "ok"

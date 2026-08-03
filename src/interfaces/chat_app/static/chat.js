@@ -1761,14 +1761,16 @@ const UI = {
     const currentForm = this.collectAgentSpecForm();
     const selectedTools = currentForm.tools || [];
     const items = tools.map((tool) => {
-      const toolName = tool.name || '';
+      // Tolerate both shapes: an object {name, description} or a bare name string.
+      const toolName = typeof tool === 'string' ? tool : (tool.name || '');
+      const toolDesc = typeof tool === 'string' ? '' : (tool.description || '');
       const checked = selectedTools.includes(toolName) ? 'checked' : '';
       return `
       <label class="agent-spec-tool">
         <input type="checkbox" class="agent-spec-tool-checkbox" value="${Utils.escapeHtml(toolName)}" ${checked} />
         <div class="agent-spec-tool-info">
           <div class="agent-spec-tool-name">${Utils.escapeHtml(toolName)}</div>
-          <div class="agent-spec-tool-desc">${Utils.escapeHtml(tool.description || '')}</div>
+          <div class="agent-spec-tool-desc">${Utils.escapeHtml(toolDesc)}</div>
         </div>
       </label>`;
     });
@@ -3336,6 +3338,48 @@ const UI = {
   // Tool Step Rendering (Timeline Style)
   // =========================================================================
 
+  // A distinct activity step for the playbook that shaped this turn — shown for BOTH
+  // the /name path (body injected server-side, no tool call) and auto-pickup (the
+  // Playbook loader, surfaced here instead of as a generic tool row). Styled apart from
+  // tool steps and NOT counted as a tool: it explains WHY the tools below it ran.
+  renderPlaybookApplied(messageId, event) {
+    this.createTraceContainer(messageId);  // no-op if it already exists
+    const timeline = document.querySelector(`.trace-container[data-message-id="${messageId}"] .step-timeline`);
+    if (!timeline || !event.name) return;
+    // Key on the playbook name, not the tool_call_id: a /name turn emits one applied
+    // step server-side (no id) AND, if the model redundantly re-loads the same playbook,
+    // another via the tool (with an id). Same playbook → one step.
+    // Self-defending sink: build the id from the name reduced to [a-z0-9_-] (server
+    // _NAME_RE already enforces that, but the id/selector/onclick must not rely on it).
+    const stepId = `playbook-${String(event.name).replace(/[^a-z0-9_-]/gi, '')}`;
+    const stepIdAttr = Utils.escapeAttr(stepId);
+    if (timeline.querySelector(`[data-step-id="${stepIdAttr}"]`)) return;  // dedupe
+    // The body (the loaded playbook text) makes the step expandable — same detail the
+    // tool row used to show. Absent it, render a plain, non-clickable pill.
+    const body = event.body != null ? String(event.body).trim() : '';
+    const onclick = body ? ` onclick="UI.toggleStepExpanded('${stepIdAttr}')"` : '';
+    const toggle = body ? '<button class="step-toggle" aria-label="Expand playbook details">&#9654;</button>' : '';
+    const details = body ? `
+          <div class="step-details" style="display: none;">
+            <div class="section-label">Playbook</div>
+            <pre><code>${Utils.escapeHtml(body)}</code></pre>
+          </div>` : '';
+    timeline.insertAdjacentHTML('beforeend', `
+      <div class="step playbook-step" data-step-id="${stepIdAttr}">
+        <div class="step-connector">
+          <span class="step-marker playbook-marker"></span>
+          <div class="step-line"></div>
+        </div>
+        <div class="step-content">
+          <div class="step-header"${onclick}>
+            <span class="step-icon playbook-icon-glyph" aria-hidden="true">📘</span>
+            <span class="step-label">Playbook applied · ${Utils.escapeHtml(event.name)}</span>
+            ${toggle}
+          </div>${details}
+        </div>
+      </div>`);
+  },
+
   renderToolStart(messageId, event) {
     const timeline = document.querySelector(`.trace-container[data-message-id="${messageId}"] .step-timeline`);
     if (!timeline) return;
@@ -3638,6 +3682,10 @@ const UI = {
         const startEvent = toolStartEvents[event.tool_call_id];
         // Update the tool step with output
         this.updateHistoricalToolStep(timeline, event, startEvent);
+      } else if (event.type === 'playbook_applied') {
+        // A persisted auto-pickup step: rebuild the same expandable "Playbook applied"
+        // row (renderPlaybookApplied re-queries this message's live timeline and dedupes).
+        this.renderPlaybookApplied(messageId, event);
       } else if (event.type === 'usage') {
         usageData = event;
       }
@@ -5118,6 +5166,9 @@ const Chat = {
     const showTrace = UI.isTraceVisibleMode(UI.getTraceModeForMessage(messageId));
     if (!showTrace) return;
     switch (event.type) {
+      case 'playbook_applied':
+        UI.renderPlaybookApplied(messageId, event);
+        break;
       case 'tool_start':
         UI.renderToolStart(messageId, event);
         break;
@@ -5212,6 +5263,9 @@ const Chat = {
           this.state.activeTrace.events.push(event);
           this._renderStreamEvent(messageId, event);
         } else if (event.type === 'thinking_start' || event.type === 'thinking_end') {
+          this.state.activeTrace.events.push(event);
+          this._renderStreamEvent(messageId, event);
+        } else if (event.type === 'playbook_applied') {
           this.state.activeTrace.events.push(event);
           this._renderStreamEvent(messageId, event);
         } else if (event.type === 'chunk') {

@@ -5,11 +5,11 @@ import secrets
 def read_secret(secret_name, default=""):
     """
     Read a secret from a file or environment variable.
-    
+
     Args:
         secret_name: Name of the secret (e.g., 'POSTGRES_PASSWORD')
         default: Default value if secret is not found
-        
+
     Returns:
         The secret value, or the default if not found
     """
@@ -64,9 +64,13 @@ def read_or_create_persistent_secret(secret_name, persist_dir, filename=None):
     value = secrets.token_hex(32)
     try:
         os.makedirs(persist_dir, exist_ok=True)
-        with open(path, "w") as f:
+        # 0600 must hold from creation — open()+chmod() leaves a window where the
+        # key is world-readable; fchmod covers a pre-existing wider-mode file,
+        # which os.open's mode argument does not touch.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            os.fchmod(fd, 0o600)
             f.write(value)
-        os.chmod(path, 0o600)
     except OSError:
         pass  # unwritable dir: fall back to an ephemeral key (still valid this process)
     return value

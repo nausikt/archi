@@ -30,6 +30,31 @@ def test_generates_then_stable_across_restart(tmp_path, monkeypatch):
     assert second == first
 
 
+def test_generated_key_file_is_owner_only_from_creation(tmp_path, monkeypatch):
+    """The signing key must never be readable by other users, even briefly:
+    the file is created with mode 0600 (os.open), not created wide then
+    chmodded after the key is already on disk."""
+    monkeypatch.delenv("MY_TEST_SECRET", raising=False)
+    monkeypatch.delenv("MY_TEST_SECRET_FILE", raising=False)
+    read_or_create_persistent_secret("MY_TEST_SECRET", str(tmp_path))
+    mode = os.stat(tmp_path / ".my_test_secret").st_mode & 0o777
+    assert mode == 0o600
+
+
+def test_key_written_into_preexisting_file_gets_tightened(tmp_path, monkeypatch):
+    """An empty leftover key file with wide permissions must not receive the
+    new secret at its old mode — os.open's mode only applies at creation, so
+    the helper fchmods before writing."""
+    monkeypatch.delenv("MY_TEST_SECRET", raising=False)
+    monkeypatch.delenv("MY_TEST_SECRET_FILE", raising=False)
+    keyfile = tmp_path / ".my_test_secret"
+    keyfile.write_text("")
+    os.chmod(keyfile, 0o644)
+    value = read_or_create_persistent_secret("MY_TEST_SECRET", str(tmp_path))
+    assert keyfile.read_text() == value
+    assert (os.stat(keyfile).st_mode & 0o777) == 0o600
+
+
 def test_filename_override_keeps_per_app_keys_distinct(tmp_path, monkeypatch):
     """Two apps sharing one persist_dir (chat + uploader mount the same data
     volume) and, historically, the same secret NAME must still end up with
