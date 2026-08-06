@@ -165,7 +165,7 @@ def _build_provider_config_from_payload(config_payload: Dict[str, Any], provider
         return None
 
     models = [ModelInfo(id=m, name=m, display_name=m) for m in cfg.get("models", [])]
-    extra = {}
+    extra = dict(cfg.get("extra_kwargs") or {})
     if provider_type == ProviderType.LOCAL and cfg.get("mode"):
         extra["local_mode"] = cfg.get("mode")
 
