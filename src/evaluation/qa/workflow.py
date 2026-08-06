@@ -572,9 +572,10 @@ class QAWorkflow:
                 },
             )
 
+        shared_vs = ArchiAgentRuntime.prewarm_vectorstore(config, spec)   # main thread, before any executor
         with AtomicJsonlWriter(run_dir / "answers.jsonl") as answer_writer:
             if run_workers == 1:
-                runtime = ArchiAgentRuntime(config, spec, pipeline_class)
+                runtime = ArchiAgentRuntime(config, spec, pipeline_class, vectorstore=shared_vs)
                 for prepared, ordinal in tasks():
                     attempt_slots += 1
                     answer_writer.write(execute_attempt(runtime, prepared, ordinal))
@@ -586,7 +587,7 @@ class QAWorkflow:
                 ) -> Dict[str, Any]:
                     runtime = worker_state.__dict__.get("runtime")
                     if runtime is None:
-                        runtime = ArchiAgentRuntime(config, spec, pipeline_class)
+                        runtime = ArchiAgentRuntime(config, spec, pipeline_class, vectorstore=shared_vs)
                         worker_state.runtime = runtime
                     return execute_attempt(runtime, *task)
 
@@ -827,8 +828,13 @@ class QAWorkflow:
             )
 
         retried_answers: Dict[str, Dict[str, Any]] = {}
+        shared_vs = (
+            ArchiAgentRuntime.prewarm_vectorstore(config, spec)
+            if execution_tasks
+            else None
+        )
         if execution_tasks and run_workers == 1:
-            runtime = ArchiAgentRuntime(config, spec, pipeline_class)
+            runtime = ArchiAgentRuntime(config, spec, pipeline_class, vectorstore=shared_vs)
             for task in execution_tasks:
                 retried_answers[task["attempt_id"]] = retry_execution(runtime, task)
         elif execution_tasks:
@@ -837,7 +843,7 @@ class QAWorkflow:
             def retry_execution_parallel(task: Dict[str, Any]) -> Dict[str, Any]:
                 runtime = worker_state.__dict__.get("runtime")
                 if runtime is None:
-                    runtime = ArchiAgentRuntime(config, spec, pipeline_class)
+                    runtime = ArchiAgentRuntime(config, spec, pipeline_class, vectorstore=shared_vs)
                     worker_state.runtime = runtime
                 return retry_execution(runtime, task)
 

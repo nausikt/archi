@@ -325,24 +325,38 @@ def load_agent_inputs(
 # Until then, this adapter avoids creating dependencies that QA attempts do not
 # need.
 class ArchiAgentRuntime:
+    _load_lock = Lock()          # class-level: serializes SentenceTransformer construction
+
     def __init__(
         self,
         config: Dict[str, Any],
         spec: Any,
         pipeline_class: type,
+        vectorstore=None,
     ):
         self.config = config
         self.spec = spec
         self.pipeline_class = pipeline_class
         self.tool_calls: List[Dict[str, Any]] = []
         self._pipeline: Optional[Any] = None
-        self._vectorstore: Optional[Any] = None
+        self._vectorstore: Optional[Any] = vectorstore
+        self._vectorstore_injected = vectorstore is not None
         self._selected_tool_names = set(getattr(self.spec, "tools", []) or [])
 
     def _load_vectorstore(self) -> Any:
-        from src.archi.utils.vectorstore_connector import VectorstoreConnector
+        with ArchiAgentRuntime._load_lock:      # even lazy loads can no longer collide
+            from src.archi.utils.vectorstore_connector import VectorstoreConnector
+            return VectorstoreConnector(self.config).get_vectorstore()
 
-        return VectorstoreConnector(self.config).get_vectorstore()
+    @classmethod
+    def prewarm_vectorstore(cls, config, spec):
+        """Build the shared vectorstore once, in the caller's thread. None if spec doesn't need it."""
+        tools = set(getattr(spec, "tools", []) or [])
+        if "search_vectorstore_hybrid" not in tools:
+            return None
+        with cls._load_lock:
+            from src.archi.utils.vectorstore_connector import VectorstoreConnector
+            return VectorstoreConnector(config).get_vectorstore()
 
     def _runtime_for_attempt(self) -> Tuple[Any, Optional[Any]]:
         if self._pipeline is not None:
@@ -350,9 +364,13 @@ class ArchiAgentRuntime:
 
         chat = self.config["services"]["chat_app"]
         vectorstore = (
-            self._load_vectorstore()
-            if "search_vectorstore_hybrid" in self._selected_tool_names
-            else None
+            self._vectorstore
+            if self._vectorstore_injected
+            else (
+                self._load_vectorstore()
+                if "search_vectorstore_hybrid" in self._selected_tool_names
+                else None
+            )
         )
         pipeline = self.pipeline_class(
             config=deepcopy(self.config),
