@@ -116,10 +116,21 @@
             <label>Agent spec<select name="agent_spec" id="launch-agent" required></select></label>
             <p class="callout">The deployment’s resolved agent YAML is used. The selected Markdown spec is copied into the run.</p>
           </section>
+          <section class="panel form-card concurrency-card">
+            <span class="step">04</span><h2>Concurrency</h2>
+            <div class="field-group">
+              <label>Run workers<input name="run_workers" type="number" min="1" max="16" step="1" value="1" aria-describedby="run-workers-help" required></label>
+              <small class="field-help" id="run-workers-help">Choose 1–16 concurrent agent calls. Each worker owns a separate runtime.</small>
+            </div>
+            <div class="field-group">
+              <label>Evaluation workers<input name="score_workers" type="number" min="1" max="16" step="1" value="1" aria-describedby="score-workers-help" required></label>
+              <small class="field-help" id="score-workers-help">Choose 1–16 concurrent judge calls after every agent run finishes.</small>
+            </div>
+          </section>
           <section class="panel launch-card">
             <p class="eyebrow">Execution contract</p>
-            <h2>Run serially in the background</h2>
-            <ul><li>HTTP request returns immediately</li><li>Inputs become immutable snapshots</li><li>Progress is persisted as a job</li><li>History is derived from artifacts</li></ul>
+            <h2>Parallel by phase. Ordered by design.</h2>
+            <ul><li>Run and evaluation phases never overlap</li><li>Higher worker counts increase provider calls and memory</li><li>Artifacts retain canonical question order</li><li>One background job remains active at a time</li></ul>
             <button class="button primary large" type="submit">Start evaluation</button>
           </section>
         </form>
@@ -128,7 +139,10 @@
       <section class="view" id="view-run-detail">
         <header class="page-head">
           <div><button class="text-button" data-go="runs">← All runs</button><p class="eyebrow">Evaluation evidence</p><h1 id="run-title">Run detail</h1><p id="run-subtitle"></p></div>
-          <a class="button quiet" id="report-link" target="_blank" rel="noopener">Open report</a>
+          <div class="page-actions">
+            <button class="button primary" id="retry-failed-evaluation" type="button" hidden>Retry failed attempts</button>
+            <a class="button quiet" id="report-link" target="_blank" rel="noopener">Open report</a>
+          </div>
         </header>
         <div id="run-detail-content"></div>
       </section>
@@ -141,6 +155,7 @@
       <div class="atom-editor" id="atom-editor"></div>
       <footer>
         <label>New dataset name<input id="reviewed-dataset-name" autocomplete="off" required></label>
+        <button class="button quiet" type="button" id="retry-failed-atoms" hidden>Retry failed atoms</button>
         <button class="button quiet" type="button" data-close-atom-dialog>Cancel</button>
         <button class="button primary" type="button" id="save-reviewed-dataset">Save as new dataset</button>
       </footer>

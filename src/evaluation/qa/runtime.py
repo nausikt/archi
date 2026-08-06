@@ -3,18 +3,24 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+from threading import Lock
+from time import perf_counter
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from uuid import UUID
 
 import yaml
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.messages import BaseMessage, ToolMessage
 
 from .constants import (  # isort: skip
     COMPARATOR_SYSTEM_PROMPT,
     GOLD_SYSTEM_PROMPT,
 )
 from .profile import EvaluatorProfile
+from .tool_traces import ToolCallRecord, ToolCallStatus
 from .validation import Atom
 
 GOLD_ATOM_SCHEMA = {
@@ -68,6 +74,126 @@ JUDGMENT_SCHEMA = {
     },
     "required": ["judgments"],
 }
+
+
+@dataclass(frozen=True)
+class _ActiveToolCall:
+    ordinal: int
+    name: str
+    query: str
+    started_at: float
+
+
+def _trace_text(value: Any) -> str:
+    if isinstance(value, BaseMessage):
+        value = value.content
+    if isinstance(value, BaseException):
+        return str(value)
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+class ToolTimingCallback(BaseCallbackHandler):
+    """Collect the complete observed tool trace for one agent attempt."""
+
+    run_inline = True
+
+    def __init__(self) -> None:
+        self._active: Dict[UUID, _ActiveToolCall] = {}
+        self._next_ordinal = 1
+        self._completed: List[ToolCallRecord] = []
+        self._lock = Lock()
+
+    def on_tool_start(
+        self,
+        serialized: Dict[str, Any],
+        input_str: str,
+        *,
+        run_id: UUID,
+        inputs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        started_at = perf_counter()
+        with self._lock:
+            ordinal = self._next_ordinal
+            self._next_ordinal += 1
+        active = _ActiveToolCall(
+            ordinal=ordinal,
+            name=serialized["name"],
+            query=_trace_text(inputs if inputs is not None else input_str),
+            started_at=started_at,
+        )
+        with self._lock:
+            self._active[run_id] = active
+
+    def _finish(
+        self,
+        run_id: UUID,
+        status: ToolCallStatus,
+        output: Any,
+    ) -> None:
+        ended_at = perf_counter()
+        text = _trace_text(output)
+        with self._lock:
+            active = self._active.pop(run_id)
+            self._completed.append(
+                ToolCallRecord(
+                    ordinal=active.ordinal,
+                    name=active.name,
+                    status=status,
+                    query=active.query,
+                    response=text if status == ToolCallStatus.SUCCESS else None,
+                    error=text if status == ToolCallStatus.ERROR else None,
+                    duration_ms=max(
+                        0,
+                        int(round((ended_at - active.started_at) * 1000)),
+                    ),
+                )
+            )
+
+    @property
+    def traces(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            traces = list(self._completed)
+            traces.extend(
+                ToolCallRecord(
+                    ordinal=active.ordinal,
+                    name=active.name,
+                    status=ToolCallStatus.INCOMPLETE,
+                    query=active.query,
+                )
+                for active in self._active.values()
+            )
+        return [
+            trace.to_dict() for trace in sorted(traces, key=lambda item: item.ordinal)
+        ]
+
+    def on_tool_end(
+        self,
+        output: Any,
+        *,
+        run_id: UUID,
+        **kwargs: Any,
+    ) -> None:
+        status = (
+            ToolCallStatus.ERROR
+            if isinstance(output, ToolMessage) and output.status == "error"
+            else ToolCallStatus.SUCCESS
+        )
+        self._finish(run_id, status, output)
+
+    def on_tool_error(
+        self,
+        error: BaseException,
+        *,
+        run_id: UUID,
+        **kwargs: Any,
+    ) -> None:
+        self._finish(run_id, ToolCallStatus.ERROR, error)
 
 
 class LangChainEvaluatorRuntime:
@@ -193,6 +319,11 @@ def load_agent_inputs(
     return config, spec, spec_text, pipeline_class
 
 
+# TODO: Remove this evaluation-specific runtime once the generic `archi`
+# runtime is refactored to initialize vector-store connections and other tool
+# dependencies only when they are selected by the resolved agent config/spec.
+# Until then, this adapter avoids creating dependencies that QA attempts do not
+# need.
 class ArchiAgentRuntime:
     def __init__(
         self,
@@ -203,18 +334,24 @@ class ArchiAgentRuntime:
         self.config = config
         self.spec = spec
         self.pipeline_class = pipeline_class
+        self.tool_calls: List[Dict[str, Any]] = []
+        self._pipeline: Optional[Any] = None
+        self._vectorstore: Optional[Any] = None
+        self._selected_tool_names = set(getattr(self.spec, "tools", []) or [])
 
     def _load_vectorstore(self) -> Any:
         from src.archi.utils.vectorstore_connector import VectorstoreConnector
 
         return VectorstoreConnector(self.config).get_vectorstore()
 
-    def run(self, question: str) -> str:
+    def _runtime_for_attempt(self) -> Tuple[Any, Optional[Any]]:
+        if self._pipeline is not None:
+            return self._pipeline, self._vectorstore
+
         chat = self.config["services"]["chat_app"]
-        selected_tool_names = set(getattr(self.spec, "tools", []) or [])
         vectorstore = (
             self._load_vectorstore()
-            if "search_vectorstore_hybrid" in selected_tool_names
+            if "search_vectorstore_hybrid" in self._selected_tool_names
             else None
         )
         pipeline = self.pipeline_class(
@@ -223,14 +360,32 @@ class ArchiAgentRuntime:
             default_provider=chat["default_provider"],
             default_model=chat["default_model"],
         )
-        if "mcp" in selected_tool_names and not pipeline.loaded_mcp_tools:
+        if "mcp" in self._selected_tool_names and not pipeline.loaded_mcp_tools:
             raise RuntimeError(
                 "agent spec selected 'mcp', but no MCP tools were loaded"
             )
-        output = pipeline.invoke(
-            history=[("User", question)],
-            vectorstore=vectorstore,
-        )
+
+        # Cache only a completely initialized runtime. A failed initialization
+        # remains retryable by the next independently accounted attempt.
+        self._pipeline = pipeline
+        self._vectorstore = vectorstore
+        return pipeline, vectorstore
+
+    def run(self, question: str) -> str:
+        self.tool_calls = []
+        timing_callback = ToolTimingCallback()
+        pipeline, vectorstore = self._runtime_for_attempt()
+        try:
+            output = pipeline.invoke(
+                history=[("User", question)],
+                vectorstore=vectorstore,
+                callbacks=[timing_callback],
+            )
+        finally:
+            self.tool_calls = sorted(
+                timing_callback.traces,
+                key=lambda timing: timing["ordinal"],
+            )
         answer = output.answer
         if not isinstance(answer, str) or not answer.strip():
             raise ValueError("Archi produced no usable terminal answer")

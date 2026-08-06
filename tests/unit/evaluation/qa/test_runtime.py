@@ -4,7 +4,11 @@ from types import SimpleNamespace
 import pytest
 
 from src.evaluation.qa import runtime
-from src.evaluation.qa.runtime import ArchiAgentRuntime, LangChainEvaluatorRuntime
+from src.evaluation.qa.runtime import (
+    ArchiAgentRuntime,
+    LangChainEvaluatorRuntime,
+    ToolTimingCallback,
+)
 from src.evaluation.qa.profile import load_profile
 from src.evaluation.qa.validation import Atom
 
@@ -161,6 +165,102 @@ class _Output:
         self.answer = answer
 
 
+def test_tool_timing_callback_records_complete_success_and_error(monkeypatch):
+    from uuid import UUID
+
+    clock = {"now": 10.0}
+    monkeypatch.setattr(runtime, "perf_counter", lambda: clock["now"])
+    callback = ToolTimingCallback()
+    first_run = UUID("00000000-0000-0000-0000-000000000001")
+    second_run = UUID("00000000-0000-0000-0000-000000000002")
+
+    callback.on_tool_start(
+        {"name": "search"},
+        "{'query': 'fallback'}",
+        run_id=first_run,
+        inputs={"query": "complete query"},
+    )
+    clock["now"] = 10.125
+    callback.on_tool_end({"matches": ["first", "second"]}, run_id=first_run)
+    callback.on_tool_start({"name": "lookup"}, "id", run_id=second_run)
+    clock["now"] = 10.5
+    callback.on_tool_error(RuntimeError("failed"), run_id=second_run)
+
+    assert callback.traces == [
+        {
+            "ordinal": 1,
+            "name": "search",
+            "status": "success",
+            "query": '{"query": "complete query"}',
+            "response": '{"matches": ["first", "second"]}',
+            "duration_ms": 125,
+        },
+        {
+            "ordinal": 2,
+            "name": "lookup",
+            "status": "error",
+            "query": "id",
+            "error": "failed",
+            "duration_ms": 375,
+        },
+    ]
+
+
+def test_tool_timing_callback_retains_unfinished_call_without_invented_fields():
+    from uuid import UUID
+
+    callback = ToolTimingCallback()
+    callback.on_tool_start(
+        {"name": "slow-search"},
+        "complete untruncated query",
+        run_id=UUID("00000000-0000-0000-0000-000000000004"),
+    )
+
+    assert callback.traces == [
+        {
+            "ordinal": 1,
+            "name": "slow-search",
+            "status": "incomplete",
+            "query": "complete untruncated query",
+        }
+    ]
+
+
+def test_tool_timing_callback_does_not_truncate_query_or_response():
+    from uuid import UUID
+
+    callback = ToolTimingCallback()
+    query = "query-" + ("q" * 20_000)
+    response = "response-" + ("r" * 20_000)
+    run_id = UUID("00000000-0000-0000-0000-000000000005")
+
+    callback.on_tool_start({"name": "complete"}, query, run_id=run_id)
+    callback.on_tool_end(response, run_id=run_id)
+
+    assert callback.traces[0]["query"] == query
+    assert callback.traces[0]["response"] == response
+
+
+def test_tool_timing_callback_integrates_with_langchain_tool():
+    from langchain_core.tools import tool
+
+    @tool
+    def double(value: int) -> int:
+        """Double one integer."""
+        return value * 2
+
+    callback = ToolTimingCallback()
+
+    assert double.invoke({"value": 4}, config={"callbacks": [callback]}) == 8
+    assert callback.traces[0]["ordinal"] == 1
+    assert callback.traces[0]["name"] == "double"
+    assert callback.traces[0]["status"] == "success"
+    assert callback.traces[0]["query"] == '{"value": 4}'
+    assert callback.traces[0]["response"] == "8"
+    assert isinstance(callback.traces[0]["duration_ms"], int)
+    assert callback.traces[0]["duration_ms"] >= 0
+
+
 def _config():
     return {
         "services": {
@@ -169,7 +269,68 @@ def _config():
     }
 
 
-def test_archi_runtime_creates_fresh_pipeline_per_attempt():
+def test_archi_runtime_reuses_pipeline_with_fresh_attempt_history():
+    class Pipeline:
+        instances = 0
+        histories = []
+
+        def __init__(self, **kwargs):
+            Pipeline.instances += 1
+
+        def invoke(self, **kwargs):
+            Pipeline.histories.append(kwargs["history"])
+            return _Output("final answer")
+
+    agent = ArchiAgentRuntime(_config(), SimpleNamespace(tools=[]), Pipeline)
+
+    assert agent.run("first question") == "final answer"
+    assert agent.run("second question") == "final answer"
+    assert Pipeline.instances == 1
+    assert Pipeline.histories == [
+        [("User", "first question")],
+        [("User", "second question")],
+    ]
+
+
+def test_archi_runtime_reuses_vectorstore_with_cached_pipeline(monkeypatch):
+    vectorstore = object()
+    loads = []
+    received_vectorstores = []
+
+    class Pipeline:
+        def __init__(self, **kwargs):
+            pass
+
+        def invoke(self, **kwargs):
+            received_vectorstores.append(kwargs["vectorstore"])
+            return _Output("final answer")
+
+    def load_vectorstore(self):
+        loads.append(True)
+        return vectorstore
+
+    monkeypatch.setattr(
+        ArchiAgentRuntime,
+        "_load_vectorstore",
+        load_vectorstore,
+    )
+    agent = ArchiAgentRuntime(
+        _config(),
+        SimpleNamespace(tools=["search_vectorstore_hybrid"]),
+        Pipeline,
+    )
+
+    agent.run("first question")
+    agent.run("second question")
+
+    assert loads == [True]
+    assert received_vectorstores == [vectorstore, vectorstore]
+
+
+def test_archi_runtime_does_not_cache_failed_initialization(monkeypatch):
+    vectorstore = object()
+    loads = []
+
     class Pipeline:
         instances = 0
 
@@ -179,11 +340,29 @@ def test_archi_runtime_creates_fresh_pipeline_per_attempt():
         def invoke(self, **kwargs):
             return _Output("final answer")
 
-    agent = ArchiAgentRuntime(_config(), SimpleNamespace(tools=[]), Pipeline)
+    def load_vectorstore(self):
+        loads.append(True)
+        if len(loads) == 1:
+            raise RuntimeError("vector store is starting")
+        return vectorstore
 
-    assert agent.run("question") == "final answer"
-    assert agent.run("question") == "final answer"
-    assert Pipeline.instances == 2
+    monkeypatch.setattr(
+        ArchiAgentRuntime,
+        "_load_vectorstore",
+        load_vectorstore,
+    )
+    agent = ArchiAgentRuntime(
+        _config(),
+        SimpleNamespace(tools=["search_vectorstore_hybrid"]),
+        Pipeline,
+    )
+
+    with pytest.raises(RuntimeError, match="vector store is starting"):
+        agent.run("first question")
+
+    assert agent.run("second question") == "final answer"
+    assert loads == [True, True]
+    assert Pipeline.instances == 1
 
 
 def test_archi_runtime_reports_vectorstore_failure_from_attempt(monkeypatch):
@@ -223,10 +402,42 @@ def test_archi_runtime_uses_normal_pipeline_invocation(monkeypatch):
 
     assert answer == "final answer"
     assert "strict_tool_loading" not in observed["init"]
-    assert observed["invoke"] == {
-        "history": [("User", "question")],
-        "vectorstore": vectorstore,
-    }
+    assert observed["invoke"]["history"] == [("User", "question")]
+    assert observed["invoke"]["vectorstore"] is vectorstore
+    assert len(observed["invoke"]["callbacks"]) == 1
+    assert isinstance(observed["invoke"]["callbacks"][0], ToolTimingCallback)
+
+
+def test_archi_runtime_collects_tool_timings(monkeypatch):
+    from uuid import UUID
+
+    ticks = iter((3.0, 3.125))
+    monkeypatch.setattr(runtime, "perf_counter", lambda: next(ticks))
+
+    class Pipeline:
+        def __init__(self, **kwargs):
+            pass
+
+        def invoke(self, **kwargs):
+            callback = kwargs["callbacks"][0]
+            run_id = UUID("00000000-0000-0000-0000-000000000003")
+            callback.on_tool_start({"name": "search"}, "query", run_id=run_id)
+            callback.on_tool_end("result", run_id=run_id)
+            return _Output("final answer")
+
+    agent = ArchiAgentRuntime(_config(), SimpleNamespace(tools=[]), Pipeline)
+
+    assert agent.run("question") == "final answer"
+    assert agent.tool_calls == [
+        {
+            "ordinal": 1,
+            "name": "search",
+            "status": "success",
+            "query": "query",
+            "response": "result",
+            "duration_ms": 125,
+        }
+    ]
 
 
 def test_archi_runtime_fails_before_model_when_selected_mcp_tools_did_not_load():
@@ -245,17 +456,41 @@ def test_archi_runtime_fails_before_model_when_selected_mcp_tools_did_not_load()
 
 def test_archi_runtime_invokes_model_when_selected_mcp_tools_loaded():
     class Pipeline:
+        instances = 0
+
         def __init__(self, **kwargs):
+            Pipeline.instances += 1
             self.loaded_mcp_tools = [SimpleNamespace(name="search")]
 
         def invoke(self, **kwargs):
             return _Output("grounded answer")
 
-    answer = ArchiAgentRuntime(_config(), SimpleNamespace(tools=["mcp"]), Pipeline).run(
-        "question"
-    )
+    agent = ArchiAgentRuntime(_config(), SimpleNamespace(tools=["mcp"]), Pipeline)
 
-    assert answer == "grounded answer"
+    assert agent.run("first question") == "grounded answer"
+    assert agent.run("second question") == "grounded answer"
+    assert Pipeline.instances == 1
+
+
+def test_archi_runtime_does_not_cache_pipeline_with_missing_mcp_tools():
+    class Pipeline:
+        instances = 0
+
+        def __init__(self, **kwargs):
+            Pipeline.instances += 1
+            self.loaded_mcp_tools = []
+
+        def invoke(self, **kwargs):
+            raise AssertionError("model must not run without selected MCP tools")
+
+    agent = ArchiAgentRuntime(_config(), SimpleNamespace(tools=["mcp"]), Pipeline)
+
+    with pytest.raises(RuntimeError, match="selected 'mcp'.*no MCP tools"):
+        agent.run("first question")
+    with pytest.raises(RuntimeError, match="selected 'mcp'.*no MCP tools"):
+        agent.run("second question")
+
+    assert Pipeline.instances == 2
 
 
 def test_archi_runtime_rejects_empty_answer():

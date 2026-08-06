@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import yaml
 
 from .artifacts import read_json, utc_now, write_bytes, write_json
-from .preparation import prepare_dataset_items
+from .preparation import GoldExtractor, PreparationRecord, prepare_dataset_items
 from .profile import DEFAULT_PROFILE, _parse_profile
 from .validation import (  # isort: skip
     DatasetItem,
@@ -65,6 +65,27 @@ def _dataset_row(
             row[field] = value
     if atoms is not None:
         row["expected_atoms"] = list(atoms)
+    return row
+
+
+def _generated_draft_row(
+    item: DatasetItem,
+    record: PreparationRecord,
+) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "item_id": item.id,
+        "question": item.question,
+        "answer": item.answer,
+        "time_sensitive": item.time_sensitive,
+        "status": record.status,
+    }
+    if item.answer_source is not None:
+        row["answer_source"] = item.answer_source
+    if record.status == "prepared":
+        row["atom_source"] = record.atom_source
+        row["atoms"] = [atom.to_dict() for atom in record.prepared_gold_atoms]
+    elif record.error is not None:
+        row["error"] = record.error
     return row
 
 
@@ -279,7 +300,7 @@ class EvaluationCatalog:
         return path
 
     def create_atom_draft(
-        self, dataset_id: str, profile_id: str, evaluator: Any
+        self, dataset_id: str, profile_id: str, evaluator: GoldExtractor
     ) -> Dict[str, Any]:
         dataset = self.get_dataset(dataset_id)
         if dataset["atom_count"] != 0:
@@ -289,28 +310,12 @@ class EvaluationCatalog:
             )
         self.get_profile(profile_id)
         items = self.dataset_items(dataset_id)
-        prepared, results = prepare_dataset_items(items, evaluator)
-        prepared_by_id = {row["item_id"]: row for row in prepared}
-        result_by_id = {row["item_id"]: row for row in results}
-        draft_items = []
-        for item in items:
-            result = result_by_id[item.id]
-            row: Dict[str, Any] = {
-                "item_id": item.id,
-                "question": item.question,
-                "answer": item.answer,
-                "time_sensitive": item.time_sensitive,
-                "status": result["status"],
-            }
-            if item.answer_source is not None:
-                row["answer_source"] = item.answer_source
-            if result["status"] == "prepared":
-                candidate = prepared_by_id[item.id]
-                row["atom_source"] = candidate["atom_source"]
-                row["atoms"] = candidate["gold_atoms"]
-            elif "error" in result:
-                row["error"] = result["error"]
-            draft_items.append(row)
+        records = prepare_dataset_items(items, evaluator)
+        records_by_id = {record.item_id: record for record in records}
+        draft_items = [
+            _generated_draft_row(item, records_by_id[item.id])
+            for item in items
+        ]
         return self._persist_atom_draft(dataset, profile_id, draft_items)
 
     def create_atom_review_draft(self, dataset_id: str) -> Dict[str, Any]:
@@ -375,6 +380,69 @@ class EvaluationCatalog:
             raise LookupError("atom draft not found")
         return read_json(path)
 
+    def atom_retry_details(self, draft_id: str) -> Dict[str, Any]:
+        with self._lock:
+            draft = self.get_atom_draft(draft_id)
+            if draft.get("status") != "open":
+                raise ValueError("atom draft has already been saved")
+            profile_id = draft.get("profile_id")
+            if not isinstance(profile_id, str):
+                raise ValueError("only generated atom drafts can retry failed items")
+            self.get_profile(profile_id)
+            item_ids = [
+                row["item_id"]
+                for row in draft["items"]
+                if row.get("status") == "preparation_failed"
+            ]
+            if not item_ids:
+                raise ValueError("atom draft has no failed items to retry")
+            return {
+                "draft_id": draft["id"],
+                "dataset_id": draft["dataset_id"],
+                "profile_id": profile_id,
+                "item_ids": item_ids,
+            }
+
+    def retry_failed_atom_items(
+        self, draft_id: str, evaluator: GoldExtractor
+    ) -> Dict[str, Any]:
+        details = self.atom_retry_details(draft_id)
+        items_by_id = {
+            item.id: item for item in self.dataset_items(details["dataset_id"])
+        }
+        missing = sorted(set(details["item_ids"]) - set(items_by_id))
+        if missing:
+            raise ValueError(
+                "atom draft references missing dataset item(s): " + ", ".join(missing)
+            )
+        selected_items = [items_by_id[item_id] for item_id in details["item_ids"]]
+        records = prepare_dataset_items(selected_items, evaluator)
+        records_by_id = {record.item_id: record for record in records}
+        replacements = {
+            item.id: _generated_draft_row(item, records_by_id[item.id])
+            for item in selected_items
+        }
+
+        with self._lock:
+            draft = self.get_atom_draft(draft_id)
+            if draft.get("status") != "open":
+                raise ValueError("atom draft has already been saved")
+            current_failed_ids = {
+                row["item_id"]
+                for row in draft["items"]
+                if row.get("status") == "preparation_failed"
+            }
+            if not set(details["item_ids"]).issubset(current_failed_ids):
+                raise ValueError("atom draft changed while failed items were retried")
+            draft["items"] = [
+                replacements.get(row["item_id"], row) for row in draft["items"]
+            ]
+            write_json(
+                self.drafts_dir / details["draft_id"] / "draft.json",
+                draft,
+            )
+            return draft
+
     def save_reviewed_dataset(
         self, draft_id: str, name: str, reviewed_items: Any
     ) -> Dict[str, Any]:
@@ -396,8 +464,6 @@ class EvaluationCatalog:
                 atoms = validate_atoms(
                     row["atoms"],
                     context=f"reviewed_items[{index}].atoms",
-                    require_one=True,
-                    require_required=True,
                 )
                 supplied[item_id] = [atom.to_dict() for atom in atoms]
 

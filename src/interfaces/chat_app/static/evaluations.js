@@ -1,13 +1,24 @@
 (() => {
   "use strict";
 
-  const state = { datasets: [], profiles: [], agents: [], runs: [], jobs: [], selectedDataset: null, draft: null, pollingJobId: null, reviewValidationActive: false };
+  const state = { datasets: [], profiles: [], agents: [], runs: [], jobs: [], selectedDataset: null, draft: null, openRunId: null, pollingJobId: null, reviewValidationActive: false, openToolCalls: new Map(), nextToolCallKey: 1 };
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => [...document.querySelectorAll(selector)];
   const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[char]));
   const shortHash = (value) => value ? `${value.slice(0, 8)}…${value.slice(-5)}` : "built-in";
   const percent = (value) => value == null ? "—" : `${(value * 100).toFixed(1)}%`;
+  const formatDuration = (value) => {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return "—";
+    if (value < 1000) return `${Math.round(value)} ms`;
+    return `${(value / 1000).toFixed(value < 10000 ? 2 : 1)} s`;
+  };
   const when = (value) => value ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)) : "—";
+  const scoreValue = (value) => typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : null;
+  const outcomePresentation = {
+    entailed: { label: "Passed", className: "passed" },
+    not_mentioned: { label: "Not mentioned", className: "not-mentioned" },
+    contradicted: { label: "Contradicted", className: "contradicted" }
+  };
 
   async function api(url, options = {}) {
     const response = await fetch(url, options);
@@ -232,8 +243,12 @@
 
   function openAtomEditor() {
     const eligible = state.draft.items.filter((item) => !item.time_sensitive);
+    const failed = eligible.filter((item) => item.status === "preparation_failed");
     const isNewDraft = $("#atom-editor").dataset.draftId !== state.draft.id;
     $("#atom-dialog-title").textContent = `Review atoms · ${state.draft.dataset_name}`;
+    $("#retry-failed-atoms").hidden = failed.length === 0;
+    $("#retry-failed-atoms").disabled = false;
+    $("#retry-failed-atoms").textContent = `Retry failed atoms (${failed.length})`;
     if (isNewDraft) {
       state.reviewValidationActive = false;
       $("#reviewed-dataset-name").value = `${state.draft.dataset_name} · reviewed`;
@@ -267,6 +282,60 @@
     bindAtomEditor();
     if (state.reviewValidationActive) validateReviewedItems(false);
     if (!$("#atom-dialog").open) $("#atom-dialog").showModal();
+  }
+
+  async function retryFailedAtoms() {
+    if (!state.draft) return;
+    syncAtomsFromDom();
+    const retryIds = new Set(
+      state.draft.items
+        .filter((item) => item.status === "preparation_failed")
+        .map((item) => item.item_id)
+    );
+    if (!retryIds.size) return;
+    const localById = new Map(state.draft.items.map((item) => [
+      item.item_id,
+      {
+        atoms: (item.atoms || []).map((atom) => ({ ...atom })),
+        review_open: item.review_open
+      }
+    ]));
+    const button = $("#retry-failed-atoms");
+    button.disabled = true;
+    button.textContent = `Retrying ${retryIds.size} failed atom${retryIds.size === 1 ? "" : "s"}…`;
+    try {
+      const payload = await api(`/api/evaluations/atom-drafts/${encodeURIComponent(state.draft.id)}/retry-failed`, {
+        method: "POST"
+      });
+      state.jobs.unshift(payload.job);
+      renderRuntime();
+      const result = await pollJob(payload.job.id);
+      syncAtomsFromDom();
+      state.draft.items.forEach((item) => {
+        localById.set(item.item_id, {
+          atoms: (item.atoms || []).map((atom) => ({ ...atom })),
+          review_open: item.review_open
+        });
+      });
+      const draftPayload = await api(`/api/evaluations/atom-drafts/${encodeURIComponent(result.draft_id)}`);
+      draftPayload.draft.items = draftPayload.draft.items.map((item) => {
+        const local = localById.get(item.item_id);
+        if (!local) return item;
+        if (retryIds.has(item.item_id)) return { ...item, review_open: local.review_open };
+        return { ...item, atoms: local.atoms, review_open: local.review_open };
+      });
+      state.draft = draftPayload.draft;
+      openAtomEditor();
+      const remaining = state.draft.items.filter((item) => item.status === "preparation_failed").length;
+      toast(
+        remaining ? "Atom retry completed with failures" : "Failed atoms recovered",
+        remaining ? `${remaining} item${remaining === 1 ? "" : "s"} still need attention.` : "Generated candidates are ready for review."
+      );
+    } catch (error) {
+      button.disabled = false;
+      button.textContent = `Retry failed atoms (${retryIds.size})`;
+      toast("Could not retry failed atoms", error.message);
+    }
   }
 
   function atomRow(itemIndex, atomIndex, atom, itemId) {
@@ -456,6 +525,8 @@
     event.preventDefault();
     const body = Object.fromEntries(new FormData(event.currentTarget));
     body.attempts = Number(body.attempts);
+    body.run_workers = Number(body.run_workers);
+    body.score_workers = Number(body.score_workers);
     try {
       const payload = await api("/api/evaluations/runs", {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
@@ -468,37 +539,487 @@
     } catch (error) { toast("Could not run evaluation", error.message); }
   }
 
+  function groupQuestionResults(preparedItems, answers, evaluationResults) {
+    const groups = [];
+    const byId = new Map();
+    const resultsByAttempt = new Map((evaluationResults || []).map((result) => [result.attempt_id, result]));
+    (preparedItems || []).forEach((prepared) => {
+      const group = { itemId: prepared.item_id, prepared, attempts: [] };
+      groups.push(group);
+      byId.set(prepared.item_id, group);
+    });
+    (answers || []).forEach((answer) => {
+      let group = byId.get(answer.item_id);
+      if (!group) {
+        group = { itemId: answer.item_id, prepared: {}, attempts: [] };
+        groups.push(group);
+        byId.set(answer.item_id, group);
+      }
+      group.attempts.push({ answer, result: resultsByAttempt.get(answer.attempt_id) || null });
+    });
+    groups.forEach((group) => group.attempts.sort((left, right) => (left.answer.ordinal || 0) - (right.answer.ordinal || 0)));
+    return groups;
+  }
+
+  function questionScoreSummary(attempts) {
+    const scored = attempts
+      .map((attempt) => ({ attempt, score: scoreValue(attempt.result?.atom_score) }))
+      .filter((entry) => entry.score !== null);
+    if (!scored.length) return { average: null, best: null, worst: null };
+    return {
+      average: scored.reduce((total, entry) => total + entry.score, 0) / scored.length,
+      best: scored.reduce((best, entry) => entry.score > best.score ? entry : best),
+      worst: scored.reduce((worst, entry) => entry.score < worst.score ? entry : worst)
+    };
+  }
+
+  function macroMeanScoredAttemptAtomRecall(evaluationResults) {
+    const recalls = (evaluationResults || [])
+      .filter((result) => result.status === "scored" && Array.isArray(result.judgments) && result.judgments.length)
+      .map((result) => result.judgments.filter((judgment) => judgment.outcome === "entailed").length / result.judgments.length);
+    if (!recalls.length) return null;
+    return recalls.reduce((total, recall) => total + recall, 0) / recalls.length;
+  }
+
+  function questionLatencyAttempts(preparedItems, answers) {
+    const groups = new Map((preparedItems || []).map((item) => [
+      item.item_id,
+      { itemId: item.item_id, question: item.question || "Question text unavailable", attempts: [] }
+    ]));
+    (answers || []).forEach((answer) => {
+      if (typeof answer.duration_ms !== "number" || !Number.isFinite(answer.duration_ms) || answer.duration_ms < 0) return;
+      if (!groups.has(answer.item_id)) {
+        groups.set(answer.item_id, {
+          itemId: answer.item_id,
+          question: "Question text unavailable",
+          attempts: []
+        });
+      }
+      const recordedToolCalls = Array.isArray(answer.tool_calls) ? answer.tool_calls : null;
+      const timedToolCalls = recordedToolCalls
+        ? answer.tool_calls.filter((call) => typeof call.duration_ms === "number" && Number.isFinite(call.duration_ms) && call.duration_ms >= 0)
+        : null;
+      groups.get(answer.item_id).attempts.push({
+        attemptId: answer.attempt_id,
+        ordinal: answer.ordinal,
+        total: answer.duration_ms,
+        toolTotal: timedToolCalls === null ? null : timedToolCalls.reduce((total, call) => total + call.duration_ms, 0),
+        toolCount: recordedToolCalls === null ? null : recordedToolCalls.length,
+        timedToolCount: timedToolCalls === null ? null : timedToolCalls.length,
+        toolTimingComplete: recordedToolCalls !== null && timedToolCalls.length === recordedToolCalls.length
+      });
+    });
+    return [...groups.values()]
+      .filter((group) => group.attempts.length)
+      .map((group) => {
+        group.attempts.sort((left, right) => (left.ordinal || 0) - (right.ordinal || 0));
+        return group;
+      });
+  }
+
+  function renderLatencyChart(preparedItems, answers) {
+    const rows = questionLatencyAttempts(preparedItems, answers);
+    const maximumDuration = rows.length
+      ? Math.max(...rows.flatMap((row) => row.attempts.map((attempt) => attempt.total)))
+      : 0;
+    return `<section class="panel latency-panel" aria-labelledby="latency-chart-title" data-maximum-duration="${maximumDuration}">
+      <div class="latency-head">
+        <div><p class="eyebrow">Execution timing</p><h2 id="latency-chart-title">Latency per question</h2></div>
+        <div class="latency-legend" aria-label="Latency legend"><span><i class="tool"></i>Tool calls</span><span><i class="other"></i>Other agent time</span></div>
+      </div>
+      ${rows.length ? `<div class="latency-histogram" role="list">
+        ${rows.map((row) => {
+          const first = row.attempts[0];
+          return `<article class="latency-item" role="listitem" data-question-id="${esc(row.itemId)}">
+            <div class="latency-question"><code>${esc(row.itemId)}</code><span title="${esc(row.question)}">${esc(row.question)}</span></div>
+            <label class="latency-attempt"><span>Attempt</span><select name="latency-attempt-${esc(row.itemId)}" aria-label="Attempt for ${esc(row.itemId)}">
+              ${row.attempts.map((attempt) => `<option value="${esc(attempt.attemptId)}" data-total="${attempt.total}" data-tool="${attempt.toolTotal === null ? "" : attempt.toolTotal}" data-tool-count="${attempt.toolCount === null ? "" : attempt.toolCount}" data-timed-tool-count="${attempt.timedToolCount === null ? "" : attempt.timedToolCount}" data-tool-timing-complete="${attempt.toolTimingComplete}">Attempt ${esc(attempt.ordinal ?? "—")}</option>`).join("")}
+            </select></label>
+            <div class="latency-plot">
+              <div class="latency-bar" role="img" aria-label="Latency for ${esc(row.itemId)}, attempt ${esc(first.ordinal ?? "—")}">
+                <span class="latency-other-segment"></span>
+                <span class="latency-tool-segment"></span>
+                <span class="latency-unknown-segment"></span>
+              </div>
+            </div>
+            <div class="latency-values">
+              <strong class="latency-total-value"></strong>
+              <span class="latency-tool-value"></span>
+              <span class="latency-other-value"></span>
+              <small class="latency-tool-count"></small>
+            </div>
+          </article>`;
+        }).join("")}
+      </div>` : `<div class="latency-unavailable"><strong>Latency unavailable for this run.</strong><span>This historical run has no authoritative per-attempt timings.</span></div>`}
+    </section>`;
+  }
+
+  function bindLatencyChart() {
+    const panel = $(".latency-panel");
+    if (!panel) return;
+    const maximumDuration = Number(panel.dataset.maximumDuration);
+    $$(".latency-item").forEach((item) => {
+      const select = item.querySelector("select");
+      const bar = item.querySelector(".latency-bar");
+      const toolSegment = item.querySelector(".latency-tool-segment");
+      const otherSegment = item.querySelector(".latency-other-segment");
+      const unknownSegment = item.querySelector(".latency-unknown-segment");
+      const update = () => {
+        const option = select.selectedOptions[0];
+        const total = Number(option.dataset.total);
+        const toolAvailable = option.dataset.tool !== "";
+        const toolTimingComplete = option.dataset.toolTimingComplete === "true";
+        const toolTotal = toolAvailable ? Number(option.dataset.tool) : null;
+        const representedTool = toolAvailable ? Math.min(toolTotal, total) : 0;
+        const other = toolTimingComplete ? Math.max(0, total - representedTool) : null;
+        const barHeight = maximumDuration > 0 ? (total / maximumDuration) * 100 : 0;
+        const toolHeight = total > 0 ? (representedTool / total) * 100 : 0;
+        const otherHeight = toolTimingComplete ? 100 - toolHeight : 0;
+        const unknownHeight = toolAvailable && !toolTimingComplete ? 100 - toolHeight : (toolAvailable ? 0 : 100);
+
+        bar.style.height = `${barHeight.toFixed(2)}%`;
+        toolSegment.style.height = `${toolHeight.toFixed(2)}%`;
+        otherSegment.style.height = `${otherHeight.toFixed(2)}%`;
+        unknownSegment.style.height = `${unknownHeight.toFixed(2)}%`;
+        item.querySelector(".latency-total-value").textContent = `${formatDuration(total)} total`;
+        const timedToolCount = option.dataset.timedToolCount;
+        const toolCount = option.dataset.toolCount;
+        item.querySelector(".latency-tool-value").textContent = toolAvailable && timedToolCount !== "0"
+          ? `${formatDuration(toolTotal)} ${toolTimingComplete ? "tools" : "timed tools"}`
+          : "Tool timing unavailable";
+        item.querySelector(".latency-other-value").textContent = toolTimingComplete
+          ? `${formatDuration(other)} other agent time`
+          : (toolAvailable ? "Remaining time unattributed" : "Remaining time unavailable");
+        item.querySelector(".latency-tool-count").textContent = toolAvailable
+          ? (timedToolCount === toolCount
+            ? `${toolCount} tool call${toolCount === "1" ? "" : "s"}`
+            : `${timedToolCount} timed of ${toolCount} tool call${toolCount === "1" ? "" : "s"}`)
+          : "";
+        bar.setAttribute(
+          "aria-label",
+          `${item.dataset.questionId}, ${option.textContent}: ${formatDuration(total)} total; ${toolTimingComplete ? `${formatDuration(toolTotal)} in tools and ${formatDuration(other)} in other agent time` : (toolAvailable && timedToolCount !== "0" ? `${formatDuration(toolTotal)} in timed tools; remaining time unattributed` : "tool timing unavailable; remaining time unattributed")}`
+        );
+      };
+      select.addEventListener("change", update);
+      requestAnimationFrame(update);
+    });
+  }
+
+  function readableError(error) {
+    if (!error) return "";
+    if (typeof error === "string") return error;
+    if (typeof error.message === "string") return error.message;
+    return JSON.stringify(error);
+  }
+
+  function renderAtomJudgment(atom, judgment, atomIndex) {
+    const outcome = outcomePresentation[judgment?.outcome] || {
+      label: judgment?.outcome ? judgment.outcome.replaceAll("_", " ") : "Not judged",
+      className: "unscored"
+    };
+    return `<details class="atom-judgment outcome-${esc(outcome.className)}" open>
+      <summary>
+        <span class="atom-judgment-title"><code>${esc(atom.id || `Atom ${atomIndex + 1}`)}</code>${atom.required ? `<span class="required-chip">Required</span>` : ""}</span>
+        <span class="atom-outcome ${esc(outcome.className)}" aria-label="Evaluator outcome: ${esc(judgment?.outcome || "not judged")}">${esc(outcome.label)}</span>
+      </summary>
+      <div class="atom-judgment-body">
+        <section>
+          <p class="field-label">Expected content</p>
+          <div class="evidence-copy">${esc(atom.text || "Expected atom content is unavailable.")}</div>
+        </section>
+        <section class="judgment-copy">
+          <p class="field-label">Evaluator judgment</p>
+          <p>${esc(judgment?.rationale || "No evaluator judgment is available for this atom.")}</p>
+        </section>
+      </div>
+    </details>`;
+  }
+
+  function formatToolTraceText(value) {
+    if (typeof value !== "string") return JSON.stringify(value, null, 2);
+    const trimmed = value.trim();
+    if (!trimmed) return value;
+    try {
+      const structured = JSON.parse(trimmed);
+      if (structured === null || typeof structured !== "object") return value;
+    } catch (_error) {
+      return value;
+    }
+    let output = "";
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    const indentation = () => "  ".repeat(depth);
+    for (const char of trimmed) {
+      if (inString) {
+        output += char;
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === '"') inString = false;
+        continue;
+      }
+      if (char === '"') {
+        inString = true;
+        output += char;
+      } else if (char === "{" || char === "[") {
+        depth += 1;
+        output += `${char}\n${indentation()}`;
+      } else if (char === "}" || char === "]") {
+        depth -= 1;
+        output = `${output.trimEnd()}\n${indentation()}${char}`;
+      } else if (char === ",") {
+        output += `,\n${indentation()}`;
+      } else if (char === ":") {
+        output += ": ";
+      } else if (!/\s/.test(char)) {
+        output += char;
+      }
+    }
+    return output;
+  }
+
+  function hasOwn(object, field) {
+    return Object.prototype.hasOwnProperty.call(object, field);
+  }
+
+  function renderToolCall(call) {
+    const key = `tool-call-${state.nextToolCallKey++}`;
+    state.openToolCalls.set(key, call);
+    const durationAvailable = typeof call.duration_ms === "number"
+      && Number.isFinite(call.duration_ms)
+      && call.duration_ms >= 0;
+
+    return `<details class="tool-call-detail status-${esc(call.status)}" data-tool-key="${key}" data-tool-ordinal="${esc(call.ordinal)}">
+      <summary>
+        <span class="tool-call-title"><code>#${esc(call.ordinal)}</code><strong>${esc(call.name)}</strong></span>
+        <span class="tool-call-meta">
+          <span class="tool-call-status">${esc(call.status.replaceAll("_", " "))}</span>
+          ${durationAvailable ? `<span class="tool-call-duration">${esc(call.duration_ms)} ms</span>` : ""}
+        </span>
+      </summary>
+      <div class="tool-call-body" data-tool-call-body></div>
+    </details>`;
+  }
+
+  function appendToolTraceSection(body, label, value, labelId, className = "") {
+    const section = document.createElement("section");
+    if (className) section.className = className;
+    const heading = document.createElement("p");
+    heading.className = "field-label";
+    heading.id = labelId;
+    heading.textContent = label;
+    const content = document.createElement("pre");
+    content.tabIndex = 0;
+    content.setAttribute("role", "region");
+    content.setAttribute("aria-labelledby", labelId);
+    content.textContent = formatToolTraceText(value);
+    section.append(heading, content);
+    body.append(section);
+  }
+
+  function hydrateToolCall(detail) {
+    const body = detail.querySelector("[data-tool-call-body]");
+    if (!body || body.dataset.hydrated === "true") return;
+    const call = state.openToolCalls.get(detail.dataset.toolKey);
+    if (!call) return;
+    const queryAvailable = hasOwn(call, "query");
+    const responseField = hasOwn(call, "error") ? "error" : (hasOwn(call, "response") ? "response" : null);
+    if (!queryAvailable && responseField === null) {
+      const unavailable = document.createElement("p");
+      unavailable.className = "tool-call-unavailable";
+      unavailable.textContent = "Query and response details were not captured for this historical call.";
+      body.append(unavailable);
+    } else {
+      if (queryAvailable) appendToolTraceSection(
+        body,
+        "Query",
+        call.query,
+        `${detail.dataset.toolKey}-query-label`,
+      );
+      if (responseField) {
+        appendToolTraceSection(
+          body,
+          responseField === "error" ? "Error" : "Response",
+          call[responseField],
+          `${detail.dataset.toolKey}-${responseField}-label`,
+          `tool-call-${responseField}`,
+        );
+      } else {
+        const unavailable = document.createElement("p");
+        unavailable.className = "tool-call-unavailable";
+        unavailable.textContent = "No tool response was captured for this incomplete call.";
+        body.append(unavailable);
+      }
+    }
+    body.dataset.hydrated = "true";
+    state.openToolCalls.delete(detail.dataset.toolKey);
+  }
+
+  function bindToolCallDetails() {
+    $$(".tool-call-detail").forEach((detail) => detail.addEventListener("toggle", () => {
+      if (detail.open) hydrateToolCall(detail);
+    }));
+  }
+
+  function renderToolCalls(answer) {
+    if (!Array.isArray(answer.tool_calls)) {
+      return `<details class="readable-disclosure tool-call-disclosure">
+        <summary><span>Tool calls</span><small>Details unavailable</small></summary>
+        <div class="tool-call-empty"><strong>Tool-call details were not captured for this historical attempt.</strong></div>
+      </details>`;
+    }
+    const calls = [...answer.tool_calls].sort((left, right) => (left.ordinal || 0) - (right.ordinal || 0));
+    const countLabel = `${calls.length} call${calls.length === 1 ? "" : "s"}`;
+    return `<details class="readable-disclosure tool-call-disclosure">
+      <summary><span>Tool calls</span><small>${countLabel}</small></summary>
+      ${calls.length
+        ? `<div class="tool-call-list">${calls.map(renderToolCall).join("")}</div>`
+        : `<div class="tool-call-empty"><strong>This attempt performed no recorded tool calls.</strong></div>`}
+    </details>`;
+  }
+
+  function renderAttempt(attempt, prepared) {
+    const answer = attempt.answer;
+    const result = attempt.result || {};
+    const score = scoreValue(result.atom_score);
+    const attemptStatus = result.status || answer.status;
+    const statusClass = result.status === "scored" ? (result.passed ? "good" : "bad") : (attemptStatus === "execution_failed" ? "bad" : "run");
+    const atoms = prepared.gold_atoms || prepared.expected_atoms || [];
+    const judgmentsByAtom = new Map((result.judgments || []).map((judgment) => [judgment.atom_id, judgment]));
+    const displayedAtoms = atoms.length
+      ? atoms
+      : (result.judgments || []).map((judgment) => ({ id: judgment.atom_id, text: "", required: false }));
+    const modelAnswer = answer.answer || result.answer;
+    return `<details class="attempt-result" data-attempt-id="${esc(answer.attempt_id)}">
+      <summary>
+        <span class="attempt-title">
+          <strong>Attempt ${esc(answer.ordinal)}</strong>
+          <span class="status ${statusClass}">${esc(attemptStatus)}</span>
+        </span>
+        <span class="attempt-score ${score === null ? "unscored" : (result.passed ? "passed" : "failed")}">${score === null ? "Not scored" : percent(score)}</span>
+      </summary>
+      <div class="attempt-body">
+        ${modelAnswer ? `<details class="readable-disclosure model-answer" open>
+          <summary><span>Model answer</span><small>Full response</small></summary>
+          <div class="evidence-copy">${esc(modelAnswer)}</div>
+        </details>` : ""}
+        ${renderToolCalls(answer)}
+        ${(result.error || answer.error) ? `<section class="attempt-error"><p class="field-label">Attempt error</p><p>${esc(readableError(result.error || answer.error))}</p></section>` : ""}
+        ${displayedAtoms.length ? `<section class="atom-evidence" aria-label="Atom judgments">
+          <div class="atom-evidence-head"><div><p class="eyebrow">Atom evidence</p><h3>Expected content and evaluator judgment</h3></div><span>${displayedAtoms.length} atom${displayedAtoms.length === 1 ? "" : "s"}</span></div>
+          <div class="atom-judgment-list">${displayedAtoms.map((atom, index) => renderAtomJudgment(atom, judgmentsByAtom.get(atom.id), index)).join("")}</div>
+        </section>` : `<div class="empty compact"><strong>No atom judgments are available for this attempt.</strong></div>`}
+      </div>
+    </details>`;
+  }
+
+  function renderQuestionGroup(group) {
+    const question = group.prepared.question || "Question text unavailable";
+    const score = questionScoreSummary(group.attempts);
+    const scoreLabel = score.average === null ? "No scored attempts" : percent(score.average);
+    const bestWorst = score.average === null
+      ? `${group.attempts.length} attempt${group.attempts.length === 1 ? "" : "s"} · awaiting scores`
+      : `Best A${score.best.attempt.answer.ordinal} ${percent(score.best.score)} · Worst A${score.worst.attempt.answer.ordinal} ${percent(score.worst.score)}`;
+    return `<details class="question-result" data-question-id="${esc(group.itemId)}">
+      <summary>
+        <span class="question-summary-copy"><code>${esc(group.itemId)}</code><strong>${esc(question)}</strong></span>
+        <span class="question-summary-score">
+          <span><small>Average score</small><strong>${scoreLabel}</strong></span>
+          <meter min="0" max="1" value="${score.average ?? 0}" aria-label="Average atom score for ${esc(group.itemId)}" aria-valuetext="${esc(scoreLabel)}">${scoreLabel}</meter>
+          <small>${esc(bestWorst)}</small>
+        </span>
+      </summary>
+      <div class="question-result-body">
+        <details class="readable-disclosure user-question" open>
+          <summary><span>User question</span><small>Full prompt</small></summary>
+          <div class="evidence-copy">${esc(question)}</div>
+        </details>
+        <div class="attempt-list">
+          ${group.attempts.map((attempt) => renderAttempt(attempt, group.prepared)).join("") || `<div class="empty compact"><strong>No attempts are available for this question.</strong></div>`}
+        </div>
+      </div>
+    </details>`;
+  }
+
   async function openRun(id) {
     try {
       const { run } = await api(`/api/evaluations/runs/${encodeURIComponent(id)}`);
       const meta = run.metadata || {}, manifest = run.manifest || {}, summary = run.summary || {};
+      state.openRunId = id;
       $("#run-title").textContent = meta.name || manifest.run_id || "Evaluation run";
       $("#run-subtitle").textContent = `${meta.dataset_name || "CLI dataset snapshot"} · ${meta.agent_spec || manifest.agent?.agent_class || "resolved agent"}`;
       $("#report-link").href = `/api/evaluations/runs/${encodeURIComponent(id)}/report`;
       $("#report-link").hidden = !run.report_available;
       const counts = summary.attempt_lifecycle_counts || {};
-      const preparedById = Object.fromEntries((run.prepared_items || []).map((item) => [item.item_id, item]));
-      const answersByAttempt = Object.fromEntries((run.answers || []).map((item) => [item.attempt_id, item]));
+      const retryableCount = (counts.execution_failed || 0) + (counts.evaluation_failed || 0);
+      const retryButton = $("#retry-failed-evaluation");
+      retryButton.hidden = retryableCount === 0 || run.capabilities?.retry_failed !== true;
+      retryButton.disabled = false;
+      retryButton.textContent = `Retry failed attempts (${retryableCount})`;
+      const parent = state.runs.find((item) => item.id === meta.retry_of_history_id);
+      state.openToolCalls = new Map();
+      state.nextToolCallKey = 1;
+      const questionGroups = groupQuestionResults(run.prepared_items || [], run.answers || [], run.evaluation_results || []);
+      const atomRecall = macroMeanScoredAttemptAtomRecall(run.evaluation_results);
       $("#run-detail-content").innerHTML = `
+        ${meta.retry_of_history_id ? `<div class="lineage-callout"><strong>Successor run ${esc(meta.retry_number || "")}</strong> · retried from ${esc(parent?.name || meta.retry_of_history_id)}. Scored attempts were carried forward unchanged.</div>` : ""}
+        ${renderLatencyChart(run.prepared_items || [], run.answers || [])}
         <div class="evidence-grid">
           <article class="evidence-card"><span>Overall pass rate</span><strong>${percent(summary.overall_attempt_pass_rate)}</strong><small>${summary.passed_attempts ?? 0} / ${summary.quality_accounted_attempts ?? 0} accounted</small></article>
-          <article class="evidence-card"><span>Scored attempts</span><strong>${counts.scored ?? 0}</strong><small>${counts.execution_failed ?? 0} execution failures</small></article>
-          <article class="evidence-card"><span>Required recall</span><strong>${percent(summary.macro_mean_scored_attempt_required_atom_recall)}</strong><small>macro mean, scored only</small></article>
+          <article class="evidence-card">
+            <div class="metric-label">
+              <span>Atoms recall</span>
+              <button class="metric-info" type="button" aria-label="About atoms recall" aria-describedby="atoms-recall-help">i</button>
+              <span class="metric-tooltip" id="atoms-recall-help" role="tooltip">
+                For each scored attempt: all atoms marked as entailed ÷ all atoms, including required and optional atoms. This card shows the unweighted average across scored attempts; technical failures are excluded. 100% means every expected fact was covered, and 90% or more is strong overall. Unlike required atoms recall, missing an optional atom lowers this metric but does not by itself fail the attempt. Not-mentioned and contradicted atoms both count as not recalled; contradictions also reduce the separate atom score.
+              </span>
+            </div>
+            <strong>${percent(atomRecall)}</strong>
+            <small>macro mean, scored only</small>
+          </article>
+          <article class="evidence-card">
+            <div class="metric-label">
+              <span>Required atoms recall</span>
+              <button class="metric-info" type="button" aria-label="About required atoms recall" aria-describedby="required-atoms-recall-help">i</button>
+              <span class="metric-tooltip" id="required-atoms-recall-help" role="tooltip">
+                For each scored attempt: required atoms marked as entailed ÷ all required atoms. This card shows the unweighted average across scored attempts; optional atoms and technical failures are excluded. Aim for 100% because every required atom is a pass condition. 90% or more is strong overall, while anything below 100% means at least one required fact was missed—inspect the attempt evidence to see whether misses are isolated or recurring.
+              </span>
+            </div>
+            <strong>${percent(summary.macro_mean_scored_attempt_required_atom_recall)}</strong>
+            <small>macro mean, scored only</small>
+          </article>
           <article class="evidence-card"><span>Artifact schema</span><strong>${esc(manifest.schema_version || "—")}</strong><small>${esc(manifest.status || "unknown")}</small></article>
         </div>
         <section class="panel"><div class="panel-head"><div><p class="eyebrow">Attempt evidence</p><h2>Answers and judgments</h2></div></div>
-          <div class="result-list">${(run.evaluation_results || []).map((result) => {
-            const prepared = preparedById[result.item_id] || {}, answer = answersByAttempt[result.attempt_id] || {};
-            return `<details class="result-item"><summary>${esc(result.item_id)} · attempt ${result.ordinal} <span class="status ${result.status === "scored" ? (result.passed ? "good" : "bad") : "bad"}">${esc(result.status)}</span></summary>
-              <div class="result-body"><strong>${esc(prepared.question || "")}</strong>
-              ${answer.answer ? `<div class="answer-box">${esc(answer.answer)}</div>` : ""}
-              ${result.error ? `<div class="answer-box">${esc(typeof result.error === "string" ? result.error : JSON.stringify(result.error))}</div>` : ""}
-              ${(result.judgments || []).map((judgment) => `<div><code>${esc(judgment.atom_id)} · ${esc(judgment.outcome)}</code><p>${esc(judgment.rationale)}</p></div>`).join("")}
-              </div></details>`;
-          }).join("") || `<div class="empty"><strong>No attempt results are available.</strong></div>`}</div>
+          <div class="result-list">${questionGroups.map((group) => renderQuestionGroup(group)).join("") || `<div class="empty"><strong>No question results are available.</strong></div>`}</div>
         </section>`;
+      bindLatencyChart();
+      bindToolCallDetails();
       showView("run-detail");
     } catch (error) { toast("Could not open run", error.message); }
+  }
+
+  async function retryFailedEvaluation() {
+    if (!state.openRunId) return;
+    const button = $("#retry-failed-evaluation");
+    const idleLabel = button.textContent;
+    button.disabled = true;
+    button.textContent = "Retrying failed attempts…";
+    try {
+      const payload = await api(`/api/evaluations/runs/${encodeURIComponent(state.openRunId)}/retry-failed`, {
+        method: "POST"
+      });
+      state.jobs.unshift(payload.job);
+      renderRuntime();
+      toast("Evaluation retry queued", "Only technically failed attempts will invoke providers.");
+      const result = await pollJob(payload.job.id);
+      await loadRuns();
+      await openRun(result.history_id);
+    } catch (error) {
+      button.disabled = false;
+      button.textContent = idleLabel;
+      toast("Could not retry evaluation", error.message);
+    }
   }
 
   $$(".nav-item").forEach((item) => item.addEventListener("click", () => showView(item.dataset.view)));
@@ -508,6 +1029,8 @@
   $("#dataset-import-form").addEventListener("submit", (event) => { event.preventDefault(); submitImport(event.currentTarget, "/api/evaluations/datasets", "Dataset"); });
   $("#profile-import-form").addEventListener("submit", (event) => { event.preventDefault(); submitImport(event.currentTarget, "/api/evaluations/profiles", "Profile"); });
   $("#evaluation-form").addEventListener("submit", launchEvaluation);
+  $("#retry-failed-atoms").addEventListener("click", retryFailedAtoms);
+  $("#retry-failed-evaluation").addEventListener("click", retryFailedEvaluation);
   $("#save-reviewed-dataset").addEventListener("click", saveReviewedDataset);
   $("#reviewed-dataset-name").addEventListener("input", () => {
     if ($("#reviewed-dataset-name-error")) validateReviewedDatasetName(false);

@@ -11,6 +11,7 @@ from .catalog import EvaluationCatalog
 from .history import EvaluationHistory
 from .jobs import EvaluationJobManager
 from .profile import load_profile
+from .runtime import LangChainEvaluatorRuntime
 from .workflow import QAWorkflow
 
 
@@ -90,8 +91,7 @@ class EvaluationConsoleService:
         profile_path = self.catalog.profile_path(profile_id)
 
         def work() -> Dict[str, Any]:
-            workflow = self.workflow_factory()
-            evaluator = workflow.evaluator_factory(load_profile(profile_path))
+            evaluator = LangChainEvaluatorRuntime(load_profile(profile_path))
             draft = self.catalog.create_atom_draft(dataset_id, profile_id, evaluator)
             return {"draft_id": draft["id"]}
 
@@ -99,6 +99,29 @@ class EvaluationConsoleService:
             "generate_atoms",
             work,
             context={"dataset_id": dataset_id, "profile_id": profile_id},
+        )
+
+    def start_atom_retry(self, draft_id: str) -> Dict[str, Any]:
+        details = self.catalog.atom_retry_details(draft_id)
+        profile_path = self.catalog.profile_path(details["profile_id"])
+
+        def work() -> Dict[str, Any]:
+            evaluator = LangChainEvaluatorRuntime(load_profile(profile_path))
+            draft = self.catalog.retry_failed_atom_items(draft_id, evaluator)
+            return {
+                "draft_id": draft["id"],
+                "retried_item_ids": details["item_ids"],
+            }
+
+        return self.jobs.start(
+            "generate_atoms",
+            work,
+            context={
+                "dataset_id": details["dataset_id"],
+                "draft_id": details["draft_id"],
+                "profile_id": details["profile_id"],
+                "retry": True,
+            },
         )
 
     def start_evaluation(
@@ -109,11 +132,15 @@ class EvaluationConsoleService:
         profile_id: str,
         agent_spec: str,
         attempts: int,
+        run_workers: int = 1,
+        score_workers: int = 1,
     ) -> Dict[str, Any]:
         if not isinstance(name, str) or not name.strip() or len(name.strip()) > 160:
             raise ValueError("evaluation name must be a non-empty string")
         if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts <= 0:
             raise ValueError("attempts must be a positive integer")
+        QAWorkflow.require_worker_count(run_workers, "run_workers")
+        QAWorkflow.require_worker_count(score_workers, "score_workers")
         dataset = self.catalog.get_dataset(dataset_id)
         profile = self.catalog.get_profile(profile_id)
         dataset_path = self.catalog.dataset_path(dataset_id)
@@ -130,6 +157,8 @@ class EvaluationConsoleService:
             "profile_id": profile_id,
             "profile_name": profile["name"],
             "agent_spec": agent_spec,
+            "run_workers": run_workers,
+            "score_workers": score_workers,
             "created_at": utc_now(),
         }
 
@@ -143,6 +172,8 @@ class EvaluationConsoleService:
                 output_dir=run_dir,
                 evaluator_profile_path=profile_path,
                 attempts=attempts,
+                run_workers=run_workers,
+                score_workers=score_workers,
                 overwrite=False,
             )
             manifest["artifacts"]["console_metadata.json"] = sha256_file(
@@ -163,6 +194,63 @@ class EvaluationConsoleService:
                 "profile_id": profile_id,
                 "agent_spec": agent_spec,
                 "attempts": attempts,
+                "run_workers": run_workers,
+                "score_workers": score_workers,
+                "workspace_id": run_dir.name,
+            },
+        )
+
+    def start_evaluation_retry(self, history_id: str) -> Dict[str, Any]:
+        parent_path = self.history.run_path(history_id)
+        parent = self.history.get_run(history_id)
+        if not parent["capabilities"]["retry_failed"]:
+            raise ValueError("legacy evaluation runs cannot be retried")
+        workflow = self.workflow_factory()
+        plan = workflow.retry_plan(parent_path)
+        parent_metadata = parent["metadata"]
+        parent_name = parent_metadata.get("name") or parent["manifest"]["run_id"]
+        retry_root_name = parent_metadata.get("retry_root_name") or parent_name
+        previous_retry_number = parent_metadata.get("retry_number")
+        retry_number = (
+            previous_retry_number + 1
+            if isinstance(previous_retry_number, int)
+            and not isinstance(previous_retry_number, bool)
+            and previous_retry_number > 0
+            else 1
+        )
+        run_dir = self.catalog.runs_dir / str(uuid.uuid4())
+        metadata = dict(parent_metadata)
+        metadata.update(
+            {
+                "name": f"{retry_root_name} · retry {retry_number}",
+                "created_at": utc_now(),
+                "retry_of_history_id": history_id,
+                "retry_number": retry_number,
+                "retry_root_name": retry_root_name,
+            }
+        )
+
+        def work() -> Dict[str, Any]:
+            run_dir.mkdir()
+            write_json(run_dir / "console_metadata.json", metadata)
+            manifest = self.workflow_factory().retry(parent_path, run_dir)
+            manifest["artifacts"]["console_metadata.json"] = sha256_file(
+                run_dir / "console_metadata.json"
+            )
+            write_json(run_dir / "manifest.json", manifest)
+            return {
+                "run_id": manifest["run_id"],
+                "history_id": self.history.id_for_path(run_dir),
+                "retry_of_history_id": history_id,
+            }
+
+        return self.jobs.start(
+            "evaluation",
+            work,
+            context={
+                "name": metadata["name"],
+                "retry_of_history_id": history_id,
+                "retry_attempt_ids": plan["retry_attempt_ids"],
                 "workspace_id": run_dir.name,
             },
         )

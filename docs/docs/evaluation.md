@@ -238,10 +238,10 @@ version: 1
 qa:
   atoms_extractor:
     provider: openai
-    model: gpt-5.5
+    model: gpt-5.6-terra
   evaluator:
     provider: openai
-    model: gpt-5.5
+    model: gpt-5.6-terra
 ```
 
 The CLI loads the profile supplied during preparation and stores the resolved
@@ -376,12 +376,21 @@ archi eval qa \
   --agent-spec agent.md \
   --evaluator-profile evaluator.yaml \
   --output-dir evaluation-run/ \
-  --attempts 4
+  --attempts 4 \
+  --run-workers 4 \
+  --score-workers 8
 ```
 
 `--attempts` defaults to `1` and must be positive. Four attempts means each
 prepared question is independently asked four times. More attempts provide a
 better view of stability but increase agent and evaluator calls linearly.
+
+`--run-workers` and `--score-workers` default to `1` and accept values from `1`
+through `16`. They control concurrency independently: the run phase must finish
+all attempts before the score phase begins. Each worker owns one runtime, and
+artifacts remain in canonical question and attempt order even when calls finish
+out of order. Start low and raise each value only within your provider's rate
+limits and the deployment's available memory.
 
 Omit `--evaluator-profile` to use the built-in profile:
 
@@ -412,14 +421,15 @@ archi eval qa prepare questions.json \
 Inspect:
 
 ```bash
-less evaluation-run/preparation_results.jsonl
-less evaluation-run/prepared_items.jsonl
+less evaluation-run/preparation.jsonl
 ```
 
-Preparation writes fixed atoms and a manifest with status `prepared`. It does
-not invoke the tested agent. If every eligible item fails preparation or is
-time-sensitive, the subsequent run refuses to start because there are no
-prepared items.
+Preparation writes exactly one terminal record per input item and a manifest
+with status `prepared`. Prepared records contain fixed atoms; failed and
+time-sensitive records contain no runnable output. Run eligibility and
+lifecycle counts come from this same artifact. Preparation does not invoke the
+tested agent. If every eligible item fails preparation or is time-sensitive,
+the subsequent run refuses to start because there are no prepared items.
 
 ### 2. Run the agent
 
@@ -427,7 +437,8 @@ prepared items.
 archi eval qa run evaluation-run/ \
   --agent-config agent.yaml \
   --agent-spec agent.md \
-  --attempts 4
+  --attempts 4 \
+  --run-workers 4
 ```
 
 Inspect:
@@ -437,14 +448,21 @@ less evaluation-run/answers.jsonl
 ```
 
 The command reads questions from the prepared workspace; it does not take the
-original dataset again. Every attempt creates a fresh selected pipeline
-instance. When all attempt slots are terminal, the manifest becomes
-`run_completed`.
+original dataset again. Each run worker owns and reuses a separate selected
+pipeline while every attempt still receives fresh invocation state. When all
+attempt slots are terminal, the manifest becomes
+`run_completed`. Each terminal answer row also records non-negative
+`duration_ms` measured only around the tested-agent execution. Its
+`tool_calls` array records each observed tool's ordinal, name, success, error,
+or incomplete status, complete query, complete response or error when observed,
+and duration when available. Content is stored without truncation. A call that
+starts without a matching terminal callback remains visible as `incomplete` and
+omits unavailable response and duration fields.
 
 ### 3. Score
 
 ```bash
-archi eval qa score evaluation-run/
+archi eval qa score evaluation-run/ --score-workers 8
 ```
 
 You may pass `--evaluator-profile evaluator.yaml`, but it must match the
@@ -542,10 +560,14 @@ rows, or import a dataset with zero atoms and generate all of them.
    preparation infers atoms for eligible rows that do not supply them, without
    a manual review checkpoint.
 4. Choose a positive attempt count.
-5. Select **Start evaluation**.
-6. Watch the background job or leave the page; the run continues in the chat
+5. Choose **Run workers** and **Evaluation workers** from `1` through `16`.
+   Run workers control simultaneous tested-agent calls. Evaluation workers
+   control simultaneous judge calls after the complete run phase. Higher values
+   increase concurrent provider requests and runtime memory.
+6. Select **Start evaluation**.
+7. Watch the background job or leave the page; the run continues in the chat
    service.
-7. Open **Runs** to inspect status, answers, judgments, metrics, and the
+8. Open **Runs** to inspect status, answers, judgments, metrics, and the
    report. The underlying run API and workspace also preserve the manifest,
    preparation records, and other raw artifacts listed below.
 
@@ -557,6 +579,63 @@ automatically.
 The Runs page is reconstructed from persisted artifacts. A malformed,
 unsupported, missing, or hash-mismatched workspace appears as an isolated
 `invalid` entry instead of breaking the history list.
+
+### Retry technical failures
+
+The console exposes retry actions only for provider or runtime failures:
+
+- an open generated atom draft with `preparation_failed` rows can retry those
+  rows in place without regenerating successful candidates or modifying the
+  imported parent dataset;
+- a scored run with `execution_failed` or `evaluation_failed` attempts can
+  create a complete successor run. Execution failures rerun Archi and the
+  comparator, while evaluation failures reuse the verified terminal answer and
+  rerun only the comparator.
+
+Successful scored attempts are carried forward unchanged. The parent run
+remains immutable, the successor records its direct parent and retry selection,
+and both runs remain visible in history. Evaluation retries inherit the parent's
+run and score worker counts. Scored attempts that merely fail the quality
+threshold are not retryable.
+
+Atom retries require `evaluations:manage`; evaluation retries require
+`evaluations:run`. A draft or run without retryable technical failures creates
+neither a job nor a new artifact.
+
+### Inspect per-question latency
+
+Run detail displays tested-agent latency per question before the aggregate
+quality metrics. Each question provides an attempt selector. The selected
+attempt's vertical bar stacks summed tool-call latency and remaining agent time;
+the full height is the authoritative attempt `duration_ms`. Changing the
+attempt animates the bar to its new height and composition. The tool label
+reports the raw sum of tool-call durations. If concurrent calls make that sum
+greater than total wall-clock latency, the colored tool segment is capped at the
+full bar and remaining agent time is shown as zero.
+
+If any recorded call lacks an authoritative duration, the chart still shows the
+sum of calls that were timed but labels the remaining attempt time as
+unattributed. It does not misclassify untimed tool execution as other agent
+work.
+
+Historical runs without per-attempt timings show an explicit unavailable state.
+Historical attempts that have total latency but predate tool timings show the
+total and mark the tool portion unavailable. The console does not infer latency
+from phase timestamps.
+
+### Inspect per-attempt tool calls
+
+Expand a question, then expand one of its attempts. The nested **Tool calls**
+section lists every recorded call in execution order. Expand an individual call
+to read its complete query and response or error. JSON-shaped content is
+pretty-printed, long content remains readable, and duration appears only when
+the artifact contains an authoritative `duration_ms` value.
+
+An attempt with no recorded calls says so explicitly. Historical timing-only
+calls remain listed with their available name, status, and duration, while the
+console states that their query and response details were not captured. Run
+detail returns the selected run's complete trace without truncation or
+pagination.
 
 ## Understand states
 
@@ -616,25 +695,32 @@ evaluator failures are not mistaken for good quality.
 
 ## Run workspace artifacts
 
+The current workspace schema is `qa-v1`. It introduced the canonical
+`preparation.jsonl` artifact. Current run, score, and retry workflows require
+`qa-v1`. The history console reads intact `qa-v0` workspaces through a
+read-only adapter that joins their separate `prepared_items.jsonl` and
+`preparation_results.jsonl` artifacts in memory. It never rewrites those
+historical workspaces, and they cannot be retried.
+
 | File                                  | Written in            | Contents                                                                                        |
 | ------------------------------------- | --------------------- | ----------------------------------------------------------------------------------------------- |
 | `input.snapshot.json` or `.jsonl` | Prepare               | Exact input bytes used by the run                                                               |
 | `evaluator_profile.resolved.yaml`   | Prepare               | Fixed evaluator profile                                                                         |
-| `prepared_items.jsonl`              | Prepare               | Eligible normalized rows, canonical answers, fixed atoms, and atom source                       |
-| `preparation_results.jsonl`         | Prepare               | One lifecycle record for every input item                                                       |
+| `preparation.jsonl`                 | Prepare               | One terminal record per input item, containing either runnable normalized data and fixed atoms, a skip, or a preparation failure |
 | `agent_config.resolved.yaml`        | Run                   | Exact tested Archi config                                                                       |
 | `agent_spec.resolved.md`            | Run                   | Exact tested agent spec and prompt                                                              |
-| `answers.jsonl`                     | Run                   | One terminal`answer_ready` or `execution_failed` row per attempt slot                       |
+| `answers.jsonl`                     | Run                   | One terminal `answer_ready` or `execution_failed` row per attempt slot, including tested-agent `duration_ms` and complete ordered tool-call query/response/error records with optional duration |
 | `evaluation_results.jsonl`          | Score                 | Answers, atom judgments, rationales, metrics, or terminal failures                              |
 | `summary.json`                      | Score                 | Machine-readable aggregate and per-item metrics plus provenance hashes                          |
 | `report.md`                         | Score                 | Human-readable result summary                                                                   |
-| `manifest.json`                     | Every completed phase | Schema/run version, state, phase timestamps/counts, agent metadata, and artifact SHA-256 hashes |
-| `console_metadata.json`             | Console only          | Display name and selected catalog IDs/spec                                                      |
+| `manifest.json`                     | Every completed phase | Schema/run version, state, phase timestamps/counts, phase worker counts, agent metadata, and artifact SHA-256 hashes |
+| `console_metadata.json`             | Console only          | Display name, selected catalog IDs/spec, and launch worker counts                                |
 
 The workspace is the reproducibility record. Keep it intact when comparing
-runs, and archive it with any external version identifiers you need; the
-current artifacts do not record source-control commits, release gates, token
-usage, latency, or full agent traces.
+runs, and archive it with any external version identifiers you need. The
+current artifacts record tested-agent and tool-call latency but do not record
+source-control commits, release gates, token usage, model prompts, evaluator
+prompts, or reasoning traces. Tool queries and responses are complete.
 
 ## Rerunning and integrity protection
 
@@ -709,7 +795,7 @@ evaluator credentials, structured-output support, timeouts, and chatbot logs.
 ### `run requires at least one prepared item`
 
 All rows were time-sensitive or failed atom preparation. Inspect
-`preparation_results.jsonl`, fix the rows/profile, and prepare a new workspace
+`preparation.jsonl`, fix the rows/profile, and prepare a new workspace
 or deliberately rerun preparation with `--overwrite`.
 
 ### `agent spec selected 'mcp', but no MCP tools were loaded`
