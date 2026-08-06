@@ -23,7 +23,6 @@ langgraph==1.0.2
 langchain-mcp-adapters==0.2.2
 mcp>=1.9.2,<2
 langgraph-prebuilt==1.0.8
-langchain-core==1.2.13
 langchain==1.0.3
 langchain_ollama==1.0.0
 loguru==0.7.2
