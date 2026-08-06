@@ -961,7 +961,7 @@ class BaseReActAgent:
         if not cfg:
             return {}
 
-        extra = {}
+        extra = dict(cfg.get("extra_kwargs") or {})
         try:
             provider_type = ProviderType(provider_key)
             if provider_type == ProviderType.LOCAL and cfg.get("mode"):
